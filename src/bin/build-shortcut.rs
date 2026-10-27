@@ -1,7 +1,7 @@
 //! Builds the "ixian" Apple Shortcut (macOS only: needs `plutil` + `shortcuts sign`).
 //!
 //!   cargo run --bin build-shortcut
-//!       -> shortcut/ixian.shortcut, asks server/id/secret on import
+//!       -> target/ixian.shortcut, asks server/id/secret on import
 //!   cargo run --bin build-shortcut -- --server URL --id ID --secret S --out x.shortcut
 //!       -> values baked in, no import questions
 //!   add --test to output the video instead of showing the menu
@@ -205,7 +205,7 @@ impl Args {
             secret,
             out: out.unwrap_or_else(|| {
                 Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("shortcut")
+                    .join("target")
                     .join("ixian.shortcut")
             }),
             test,

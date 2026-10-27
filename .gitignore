@@ -1,4 +1,5 @@
 /target
+*.shortcut
 node_modules/
 __pycache__/
 .env

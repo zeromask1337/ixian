@@ -89,14 +89,27 @@ Cookies are written to a temp file (`chmod 600`), passed to yt-dlp via `--cookie
 
 ## Apple Shortcut
 
-`src/bin/build-shortcut.rs` generates and signs the shortcut (macOS only: needs `plutil` + `shortcuts sign`):
+Install the latest signed build from [GitHub Releases](https://github.com/zeromask1337/ixian/releases/latest):
+
+1. Open the [latest `ixian.shortcut`](https://github.com/zeromask1337/ixian/releases/latest/download/ixian.shortcut) on your iPhone.
+2. Tap the download, then open it from **Files -> Downloads**.
+3. Tap **Add Shortcut**.
+
+By default it asks for the server URL and the Cloudflare Access service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) on import, so no secrets live in the file. Keep the token in a password manager or keychain, not in git.
+
+`src/bin/build-shortcut.rs` generates and signs a new build (macOS only: needs `plutil` + `shortcuts sign`, and an iCloud login for public signing):
 
 ```sh
-cargo run --bin build-shortcut        # -> shortcut/ixian.shortcut
-open shortcut/ixian.shortcut
+cargo run --bin build-shortcut        # -> target/ixian.shortcut
+open target/ixian.shortcut
 ```
 
-By default it asks for the server URL and the Cloudflare Access service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) on import, so no secrets live in the file. Pass `--server URL --id ID --secret S` to bake them in instead. Keep the token in a password manager or keychain, not in git.
+Pass `--server URL --id ID --secret S` to bake values in instead of asking on import. To publish a release:
+
+```sh
+cargo run --bin build-shortcut
+gh release create v0.1.0 target/ixian.shortcut -t v0.1.0 --generate-notes
+```
 
 Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors and Cloudflare Access pages show as alerts.
 
