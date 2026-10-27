@@ -4,6 +4,5 @@ target
 *.md
 .env
 *.cookies.txt
-bench
 shortcut
 __pycache__

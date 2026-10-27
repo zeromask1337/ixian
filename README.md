@@ -89,14 +89,14 @@ Cookies are written to a temp file (`chmod 600`), passed to yt-dlp via `--cookie
 
 ## Apple Shortcut
 
-`shortcut/build.ts` generates and signs the shortcut (macOS only):
+`src/bin/build-shortcut.rs` generates and signs the shortcut (macOS only: needs `plutil` + `shortcuts sign`):
 
 ```sh
-bun shortcut/build.ts        # -> shortcut/ixian.shortcut
+cargo run --bin build-shortcut        # -> shortcut/ixian.shortcut
 open shortcut/ixian.shortcut
 ```
 
-On import it asks for the server URL and the Cloudflare Access service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`), so no secrets live in the file. Keep the token in a password manager or keychain, not in git.
+By default it asks for the server URL and the Cloudflare Access service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) on import, so no secrets live in the file. Pass `--server URL --id ID --secret S` to bake them in instead. Keep the token in a password manager or keychain, not in git.
 
 Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors and Cloudflare Access pages show as alerts.
 
@@ -143,22 +143,3 @@ Smoke-tested end to end against public media (2026-10-27):
 | Instagram | `https://www.instagram.com/reel/Chunk8-jurw/` | 1,949,801-byte MP4 |
 
 Public URLs can disappear or become login-gated; use cookies when a platform asks for authentication.
-
-## Performance
-
-Benchmarked against the original Bun implementation on `master` with six public
-videos (two each from YouTube, x.com and Instagram) under concurrent load:
-
-| metric | Bun (master) | Rust |
-| --- | ---: | ---: |
-| 6 concurrent, median wall | 3.045 s | 3.229 s |
-| 12 concurrent, median wall | 3.612 s | 3.613 s |
-| cold start | 12.5 ms | 3.4 ms |
-| idle RSS | 11.9 MiB | 2.8 MiB |
-| RSS after benchmark | 47.7 MiB | 4.3 MiB |
-
-Downloads are effectively tied: yt-dlp, ffmpeg and the network are the
-bottleneck, not the HTTP server. The Rust rewrite's gains are startup time,
-memory use and removing Bun's 255-second streaming timeout. See
-[`bench/README.md`](bench/README.md) for methodology and the reproducible
-benchmark (`bench/download_bench.py`).
