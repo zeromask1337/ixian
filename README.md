@@ -1,20 +1,18 @@
 # ixian
 
-Minimal yt-dlp wrapper server written in TypeScript, running on [Bun](https://bun.sh).
+Minimal yt-dlp wrapper server written in Rust.
 Downloads videos from **YouTube**, **x.com/twitter.com** and **Instagram**, with per-platform cookie support.
 
 ## Requirements
 
-- [Bun](https://bun.sh)
+- [Rust](https://rustup.rs) (edition 2021)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`brew install yt-dlp`)
 - [ffmpeg](https://ffmpeg.org) (needed to merge best video + audio; `brew install ffmpeg`)
 
 ## Run
 
 ```sh
-bun install
-bun run dev     # watch mode
-bun run start   # plain
+cargo run --release
 ```
 
 Listens on `http://127.0.0.1:3000` by default.
@@ -26,7 +24,10 @@ docker build -t ixian .
 docker run -d --name ixian -p 127.0.0.1:3000:3000 --restart unless-stopped ixian
 ```
 
-The image bundles Bun, yt-dlp (PyPI) and ffmpeg; `HOST=0.0.0.0` and `YTDLP_PATH` are preset. Any [config](#config-env) var can be overridden with `-e`, e.g. `-e YTDLP_FORMAT='bv*+ba/b'`.
+Multi-stage build: `rust:1.99` compiles the binary, `node:24-bookworm-slim` runs it with Node
+(yt-dlp's JS runtime for YouTube challenges), yt-dlp (PyPI + EJS) and ffmpeg. `HOST=0.0.0.0`,
+`YTDLP_PATH`, `YTDLP_PLUGIN_DIR` and the yt-dlp config (`--js-runtimes node`) are preset.
+Any [config](#config-env) var can be overridden with `-e`, e.g. `-e YTDLP_FORMAT='bv*+ba/b'`.
 
 ## API
 
@@ -77,15 +78,14 @@ The cookie parameter accepts either:
 2. A raw `Cookie` header string: `"auth_token=abc; ct0=def"` — expanded to Netscape format for the platform's domain(s).
 
 For Playwright exports, join the cookie array into a header string:
-`cookies.map(c => \`${c.name}=${c.value}\`).join("; ")`.
+``cookies.map(c => `${c.name}=${c.value}`).join("; ")``.
 
 Cookies are written to a temp file (`chmod 600`), passed to yt-dlp via `--cookies`, and deleted with the download after the response is sent. They are never logged.
 
 ### Response
 
 - Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform` header). Temp files are cleaned up after streaming.
-- Errors: JSON `{ "error": "...", "platform"?, "hint"? }` with status `400` (bad request), `404`, `422` (yt-dlp failed/timeout; not 502 because Cloudflare replaces 502 bodies), `500`.
-- `url` may be a whole shared text; the first http(s) link is used. Client disconnect kills yt-dlp and removes temp files.
+- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request), `404`, `405`, `502` (yt-dlp failed/timeout), `500`.
 
 ## Apple Shortcut
 
@@ -100,24 +100,6 @@ On import it asks for the server URL and the Cloudflare Access service token (`C
 
 Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors and Cloudflare Access pages show as alerts.
 
-## Logging
-
-JSON lines on stdout (`docker logs ixian`), every line tagged with a request `id` (also returned as the `x-ixian-request-id` header and in error JSON). Cookie values are never logged, only their size.
-
-| `evt` | what it tells you |
-| --- | --- |
-| `request` | method, client ip / country / `cf-ray` / user-agent (from Cloudflare headers) |
-| `download_start` | url, platform, format selector, timeout, cookie presence |
-| `ytdlp_format` | resolved format (id, resolution, codecs, bitrate, approx size, protocol) and `extractMs` |
-| `download_progress` | every 5s: bytes, total, speed, eta, % (spot throttling) |
-| `ytdlp_exit` | exit code/signal, timed out/aborted, extract vs download ms, avg/peak speed, size, yt-dlp `WARNING`s |
-| `ytdlp_failed` | error summary and last 30 stderr lines |
-| `stream_start` / `stream_done` | file size, then bytes sent, stream ms and avg throughput to the client |
-| `stream_aborted` / `client_abort` | client hung up: bytes sent so far, %, time (e.g. Shortcut timeout) |
-| `response` | final status and time-to-headers |
-
-Slow-download triage: `extractMs` (YouTube/JS challenges) vs `downloadMs`/`avgBps` (server fetch) vs `stream_done.avgBps` or `stream_aborted.pct` (the leg to the phone).
-
 ## Config (env)
 
 | var | default | description |
@@ -125,7 +107,7 @@ Slow-download triage: `extractMs` (YouTube/JS challenges) vs `downloadMs`/`avgBp
 | `PORT` | `3000` | listen port |
 | `HOST` | `127.0.0.1` | listen host (only local by default) |
 | `YTDLP_PATH` | `yt-dlp` | yt-dlp binary |
-| `YTDLP_PLUGIN_DIR` | `<repo>/yt-dlp-plugins` | yt-dlp plugin directory |
+| `YTDLP_PLUGIN_DIR` | `<repo>/yt-dlp-plugins` | yt-dlp plugin directory (skipped when missing) |
 | `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | default format when `format` is not passed |
 | `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
@@ -133,12 +115,50 @@ Slow-download triage: `extractMs` (YouTube/JS challenges) vs `downloadMs`/`avgBp
 
 ## Notes
 
-- The whole server is one file (`src/index.ts`) built on `Bun.serve`, `Bun.spawn` and `Bun.file` — no runtime dependencies.
+- The whole server is one file (`src/main.rs`) built on `axum`, `tokio::process` and `tokio::fs`; the only external runtime dependencies are `yt-dlp` and `ffmpeg`.
 - The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself.
 - Playlists are disabled (`--no-playlist`); pass individual video URLs.
-- Downloads are saved to a unique temp file and streamed back, then deleted; the stream has to finish within Bun's max idle timeout (255s), so very large downloads may need a smaller `format` (e.g. `b[ext=mp4]/b`).
+- Downloads are saved to a unique temp file and streamed back, then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
 - Instagram: some networks drop TLS for `*.instagram.com` and geo-picked CDN edges. Two bundled yt-dlp plugins work around that:
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
   - `ixian_ig` rewrites media URLs to the shared `scontent.cdninstagram.com` endpoint (`IXIAN_IG_CDN_HOST`).
-  The plugins are loaded with `--plugin-dirs` (set `YTDLP_PLUGIN_DIR` in Docker); no global yt-dlp config is touched.
+  The plugins are loaded with `--plugin-dirs` (`YTDLP_PLUGIN_DIR`; the default `yt-dlp-plugins` next to `src/` is skipped when missing); no global yt-dlp config is touched.
 - Respect each platform's terms of service and only download content you have the right to.
+
+## Tests
+
+```sh
+cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
+cargo clippy --all-targets -- -D warnings
+```
+
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, request validation, yt-dlp failures and timeouts without touching the network.
+
+Smoke-tested end to end against public media (2026-10-27):
+
+| platform | URL | result |
+| --- | --- | --- |
+| YouTube | `https://youtu.be/aqz-KE-bpKQ` | 28,864,389-byte MP4, H.264/AAC 640×360, 634.6 s |
+| x.com | `https://x.com/i/web/status/910031516746514432` | 7,761,912-byte MP4 |
+| Instagram | `https://www.instagram.com/reel/Chunk8-jurw/` | 1,949,801-byte MP4 |
+
+Public URLs can disappear or become login-gated; use cookies when a platform asks for authentication.
+
+## Performance
+
+Benchmarked against the original Bun implementation on `master` with six public
+videos (two each from YouTube, x.com and Instagram) under concurrent load:
+
+| metric | Bun (master) | Rust |
+| --- | ---: | ---: |
+| 6 concurrent, median wall | 3.045 s | 3.229 s |
+| 12 concurrent, median wall | 3.612 s | 3.613 s |
+| cold start | 12.5 ms | 3.4 ms |
+| idle RSS | 11.9 MiB | 2.8 MiB |
+| RSS after benchmark | 47.7 MiB | 4.3 MiB |
+
+Downloads are effectively tied: yt-dlp, ffmpeg and the network are the
+bottleneck, not the HTTP server. The Rust rewrite's gains are startup time,
+memory use and removing Bun's 255-second streaming timeout. See
+[`bench/README.md`](bench/README.md) for methodology and the reproducible
+benchmark (`bench/download_bench.py`).
