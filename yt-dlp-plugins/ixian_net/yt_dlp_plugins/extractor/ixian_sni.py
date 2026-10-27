@@ -110,14 +110,15 @@ def _disable_instagram_impersonation():
 
     curl_cffi/libcurl cannot set a different SNI than the URL host, so it
     would bypass this workaround on installs that have curl_cffi available.
+    Patch the base IE so posts, stories and profiles are all covered.
     """
     try:
-        from yt_dlp.extractor.instagram import InstagramIE
+        from yt_dlp.extractor.instagram import InstagramBaseIE
     except ImportError:
         return
-    if not getattr(InstagramIE, '_ixian_no_impersonate', False):
-        InstagramIE._can_impersonate = property(lambda self: False)
-        InstagramIE._ixian_no_impersonate = True
+    if not getattr(InstagramBaseIE, '_ixian_no_impersonate', False):
+        InstagramBaseIE._can_impersonate = property(lambda self: False)
+        InstagramBaseIE._ixian_no_impersonate = True
 
 
 def _prefer_urllib(handler, request):

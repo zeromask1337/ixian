@@ -5,11 +5,11 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
   && echo 'fn main() {}' > src/main.rs \
-  && cargo build --release --locked \
+  && cargo build --release --locked --bin ixian \
   && rm -rf src
 
 COPY src ./src
-RUN touch src/main.rs && cargo build --release --locked
+RUN touch src/main.rs && cargo build --release --locked --bin ixian
 
 FROM node:24-bookworm-slim
 
