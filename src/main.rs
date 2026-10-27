@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use std::{
     collections::HashMap,
     env, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
     sync::Arc,
@@ -87,6 +87,7 @@ struct Config {
     host: String,
     port: u16,
     ytdlp: String,
+    plugin_dir: Option<PathBuf>,
     format: String,
     timeout: Duration,
     tmp: PathBuf,
@@ -100,6 +101,10 @@ impl Config {
             .unwrap_or(3000);
         let host = non_empty(env::var("HOST").ok()).unwrap_or_else(|| "127.0.0.1".into());
         let ytdlp = non_empty(env::var("YTDLP_PATH").ok()).unwrap_or_else(|| "yt-dlp".into());
+        let plugin_dir = non_empty(env::var("YTDLP_PLUGIN_DIR").ok())
+            .map(PathBuf::from)
+            .or_else(|| Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("yt-dlp-plugins")))
+            .filter(|dir| dir.is_dir());
         let format =
             non_empty(env::var("YTDLP_FORMAT").ok()).unwrap_or_else(|| DEFAULT_FORMAT.to_string());
         let timeout_ms = env::var("YTDLP_TIMEOUT_MS")
@@ -114,6 +119,7 @@ impl Config {
             host,
             port,
             ytdlp,
+            plugin_dir,
             format,
             timeout: timeout_ms,
             tmp,
@@ -359,8 +365,11 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         .arg("-f")
         .arg(format.as_deref().unwrap_or(&config.format))
         .arg("-o")
-        .arg(dir.join("%(title)s [%(id)s].%(ext)s"))
-        .stdin(Stdio::null())
+        .arg(dir.join("%(title)s [%(id)s].%(ext)s"));
+    if let Some(plugin_dir) = &config.plugin_dir {
+        cmd.arg("--plugin-dirs").arg(plugin_dir);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -768,10 +777,19 @@ printf '%s\n' "${{prefix}}fake.mp4"
         }
 
         fn config(&self, timeout: Duration) -> Arc<Config> {
+            self.config_with_plugin_dir(timeout, None)
+        }
+
+        fn config_with_plugin_dir(
+            &self,
+            timeout: Duration,
+            plugin_dir: Option<PathBuf>,
+        ) -> Arc<Config> {
             Arc::new(Config {
                 host: "127.0.0.1".into(),
                 port: 0,
                 ytdlp: self.script.to_string_lossy().into_owned(),
+                plugin_dir,
                 format: DEFAULT_FORMAT.into(),
                 timeout,
                 tmp: self.tmp.path().to_path_buf(),
@@ -848,6 +866,27 @@ printf '%s\n' "${{prefix}}fake.mp4"
         assert!(jar.contains(".twitter.com\tTRUE\t/\tTRUE\t2147483647\tct0\td=ef"));
         let mode = stdfs::metadata(&jar_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn passes_plugin_dir_when_configured() {
+        let harness = Harness::new("");
+        let plugins = harness.tmp.path().join("plugins");
+        stdfs::create_dir(&plugins).unwrap();
+        let app =
+            app(harness.config_with_plugin_dir(Duration::from_secs(30), Some(plugins.clone())));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        let index = lines
+            .iter()
+            .position(|arg| *arg == "--plugin-dirs")
+            .unwrap();
+        assert_eq!(lines[index + 1], plugins.to_string_lossy().as_ref());
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
 /target
+node_modules/
 __pycache__/
 .env
 *.cookies.txt
-
-__pycache__/

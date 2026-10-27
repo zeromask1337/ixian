@@ -1,4 +1,17 @@
-FROM oven/bun:1-debian
+FROM rust:1.99.1-slim-bookworm AS builder
+WORKDIR /app
+
+# Build dependencies in their own layer so source edits stay cheap.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+  && echo 'fn main() {}' > src/main.rs \
+  && cargo build --release --locked \
+  && rm -rf src
+
+COPY src ./src
+RUN touch src/main.rs && cargo build --release --locked
+
+FROM node:24-bookworm-slim
 
 # yt-dlp from PyPI (freshest at build time) + ffmpeg for muxing.
 # yt-dlp-ejs ships the YouTube challenge solver locally; no runtime GitHub fetch.
@@ -10,10 +23,10 @@ RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4 \
   && python3 -m venv /opt/yt-dlp \
   && /opt/yt-dlp/bin/pip install --no-cache-dir --upgrade yt-dlp yt-dlp-ejs
 
-# Use the bundled Bun as yt-dlp's JS runtime (YouTube EJS extraction)
-RUN mkdir -p /home/bun/.config/yt-dlp \
-  && printf -- '--js-runtimes bun\n' > /home/bun/.config/yt-dlp/config \
-  && chown -R bun:bun /home/bun/.config
+# Node is yt-dlp's JS runtime (YouTube EJS extraction)
+RUN mkdir -p /home/node/.config/yt-dlp \
+  && printf -- '--js-runtimes node\n' > /home/node/.config/yt-dlp/config \
+  && chown -R node:node /home/node/.config
 
 ENV YTDLP_PATH=/opt/yt-dlp/bin/yt-dlp \
     YTDLP_PLUGIN_DIR=/app/yt-dlp-plugins \
@@ -21,11 +34,10 @@ ENV YTDLP_PATH=/opt/yt-dlp/bin/yt-dlp \
     PORT=3000
 
 WORKDIR /app
-COPY --chown=bun:bun package.json ./
-COPY --chown=bun:bun src ./src
-COPY --chown=bun:bun yt-dlp-plugins ./yt-dlp-plugins
+COPY --chown=node:node yt-dlp-plugins ./yt-dlp-plugins
 RUN find /app/yt-dlp-plugins -name __pycache__ -type d -prune -exec rm -rf {} +
-USER bun
+COPY --from=builder /app/target/release/ixian /usr/local/bin/ixian
+USER node
 
 EXPOSE 3000
-CMD ["bun", "src/index.ts"]
+CMD ["ixian"]

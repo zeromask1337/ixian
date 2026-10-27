@@ -1,6 +1,9 @@
-node_modules
+target
 .git
 .gitignore
 *.md
-bun.lock
+.env
+*.cookies.txt
+bench
+shortcut
 __pycache__
