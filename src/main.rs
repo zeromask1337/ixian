@@ -242,6 +242,17 @@ fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str>
         .then(|| &value[prefix.len()..])
 }
 
+/// yt-dlp prints one filepath per downloaded item. A tweet that quotes another
+/// tweet (or carries several videos) is a playlist: the linked tweet's own
+/// media comes first, the referenced tweet's video after it. Keep the first path.
+fn primary_filepath(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(PathBuf::from)
+}
+
 fn parse_ms(value: &str) -> Option<Duration> {
     let ms = value.trim().parse::<f64>().ok()?;
     (ms.is_finite() && ms > 0.0).then(|| Duration::from_millis(ms.min(u64::MAX as f64) as u64))
@@ -356,6 +367,10 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
 
     let mut cmd = Command::new(&config.ytdlp);
     cmd.arg("--no-playlist")
+        // `--no-playlist` does not collapse tweets that reference other tweets
+        // (yt-dlp returns them as a playlist), so pin the first item explicitly.
+        .arg("--playlist-items")
+        .arg("1")
         .arg("--no-progress")
         .arg("--no-simulate")
         .arg("--print")
@@ -432,13 +447,7 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         .and_then(Result::ok)
         .unwrap_or_default();
 
-    let path = stdout
-        .trim()
-        .lines()
-        .last()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from);
+    let path = primary_filepath(&stdout);
     let media = match path {
         Some(path) if status.success() => path,
         _ => {
@@ -700,6 +709,19 @@ mod tests {
     }
 
     #[test]
+    fn picks_first_output_filepath() {
+        assert_eq!(
+            primary_filepath("/tmp/a.mp4\n/tmp/b.mp4\n"),
+            Some(PathBuf::from("/tmp/a.mp4"))
+        );
+        assert_eq!(
+            primary_filepath("\n  /tmp/a.mp4  \n"),
+            Some(PathBuf::from("/tmp/a.mp4"))
+        );
+        assert_eq!(primary_filepath(" \n\n"), None);
+    }
+
+    #[test]
     fn parses_timeouts() {
         assert_eq!(parse_ms("1500"), Some(Duration::from_millis(1500)));
         assert_eq!(parse_ms("0"), None);
@@ -887,6 +909,24 @@ printf '%s\n' "${{prefix}}fake.mp4"
             .position(|arg| *arg == "--plugin-dirs")
             .unwrap();
         assert_eq!(lines[index + 1], plugins.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn limits_downloads_to_first_playlist_item() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://x.com/user/status/1" }).to_string();
+
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        let index = lines
+            .iter()
+            .position(|arg| *arg == "--playlist-items")
+            .unwrap();
+        assert_eq!(lines[index + 1], "1");
     }
 
     #[tokio::test]
