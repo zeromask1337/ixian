@@ -19,6 +19,23 @@ Listens on `http://127.0.0.1:3000` by default.
 
 ### Docker
 
+Every GitHub release publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to GitHub Container Registry:
+
+```sh
+docker run -d --name ixian -p 127.0.0.1:3000:3000 --restart unless-stopped \
+  ghcr.io/zeromask1337/ixian:latest
+```
+
+Tags per release: `latest` (newest stable release), `0.1.1` and `0.1` (semver) and `v0.1.1` (same as the release tag). For immutable deploys pin the digest:
+
+```sh
+docker pull ghcr.io/zeromask1337/ixian@sha256:<digest>
+```
+
+The digest for each release is in the **Publish image** workflow run summary (Actions -> Publish image).
+
+To build locally instead:
+
 ```sh
 docker build -t ixian .
 docker run -d --name ixian -p 127.0.0.1:3000:3000 --restart unless-stopped ixian
@@ -108,7 +125,13 @@ Pass `--server URL --id ID --secret S` to bake values in instead of asking on im
 
 ```sh
 cargo run --bin build-shortcut
-gh release create v0.1.0 target/ixian.shortcut -t v0.1.0 --generate-notes
+gh release create v0.1.1 target/ixian.shortcut -t v0.1.1 --generate-notes
+```
+
+Publishing the release also triggers the `Publish image` workflow, which builds `linux/amd64` + `linux/arm64` and pushes `ghcr.io/zeromask1337/ixian` (see [Docker](#docker)). To backfill an existing tag:
+
+```sh
+gh workflow run publish-image.yml -f tag=v0.1.1
 ```
 
 Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors and Cloudflare Access pages show as alerts.
