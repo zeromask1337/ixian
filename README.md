@@ -52,11 +52,13 @@ Any [config](#config-env) var can be overridden with `-e`, e.g. `-e YTDLP_FORMAT
 
 | param | description |
 | --- | --- |
-| `url` | **required** video URL |
-| `platform` | optional override: `youtube`, `x`, `instagram` (otherwise detected from the URL) |
-| `youtube_cookies` / `x_cookies` / `instagram_cookies` | cookies for that platform (only the matching one is used) |
+| `url` | **required** video URL; must be `http(s)` and match a supported platform host |
+| `platform` | optional override: `youtube`, `x`, `instagram` (otherwise detected from the URL). The URL must still belong to that platform |
 | `format` | optional yt-dlp format selector (default: best mp4) |
-| `timeout_ms` | optional download timeout (default `600000`, or `YTDLP_TIMEOUT_MS`) |
+| `timeout_ms` | optional download timeout in milliseconds (default `600000`, or `YTDLP_TIMEOUT_MS`); `timeoutMs` is accepted as an alias |
+
+Cookies are **not** accepted on `GET`: they would leak into access logs and browser
+history. A `*_cookies` parameter returns `400` with a hint to use `POST /download`.
 
 ```sh
 curl -G http://127.0.0.1:3000/download \
@@ -66,7 +68,7 @@ curl -G http://127.0.0.1:3000/download \
 
 ### `POST /download`
 
-Same params in a JSON body. Prefer this for cookies (query strings have length limits).
+Same params in a JSON body (`timeout_ms`, canonical; `timeoutMs` also accepted). Prefer this for cookies (query strings have length limits). Cookies go in `cookies: { "<platform>": "..." }` or `<platform>_cookies`.
 
 ```sh
 # public posts work without cookies
@@ -97,12 +99,31 @@ The cookie parameter accepts either:
 For Playwright exports, join the cookie array into a header string:
 ``cookies.map(c => `${c.name}=${c.value}`).join("; ")``.
 
-Cookies are written to a temp file (`chmod 600`), passed to yt-dlp via `--cookies`, and deleted with the download after the response is sent. They are never logged.
+Cookies are written atomically to a `0600` temp file, passed to yt-dlp via `--cookies`, and deleted with the download after the response is sent. They are never logged.
 
 ### Response
 
 - Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform` header). Temp files are cleaned up after streaming.
-- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request), `404`, `405`, `502` (yt-dlp failed/timeout), `500`.
+- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request, including cookies on `GET` and URLs outside the platform allowlist), `404`, `405`, `413` (cookie too large), `429` (too many concurrent downloads), `502` (yt-dlp failed/timeout), `500`.
+
+### Limits
+
+| limit | value |
+| --- | --- |
+| concurrent downloads | `4` (`MAX_CONCURRENT`; excess requests return `429`) |
+| request timeout | `600000` ms (`MAX_TIMEOUT_MS`; larger values return `400`) |
+| cookie parameter | `256 KiB` (`MAX_COOKIE_BYTES`) |
+| captured stderr | `64 KiB` (`MAX_STDERR_BYTES`) |
+| output file | `2 GiB` (`MAX_FILESIZE`, also passed to yt-dlp as `--max-filesize`) |
+| request body | `16 MiB` |
+
+yt-dlp runs with `--socket-timeout 10` and `--retries 3`. The URL is passed after
+`--`, so a leading dash can never be parsed as a yt-dlp option. A `platform`
+override never bypasses the host allowlist, and the URL must use `http` or `https`.
+
+Each download runs in its own process group; a timeout or client disconnect kills
+yt-dlp and its ffmpeg children. The temp directory is created `0700` and the
+cookie jar `0600` (both atomically).
 
 ## Apple Shortcut
 
@@ -145,7 +166,7 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 | `YTDLP_PATH` | `yt-dlp` | yt-dlp binary |
 | `YTDLP_PLUGIN_DIR` | `<repo>/yt-dlp-plugins` | yt-dlp plugin directory (skipped when missing) |
 | `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | default format when `format` is not passed |
-| `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout |
+| `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout (capped at `MAX_TIMEOUT_MS`) |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
 
@@ -168,7 +189,7 @@ cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, request validation, yt-dlp failures and timeouts without touching the network.
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation and permissions (temp dir `0700`, jar `0600`), URL/platform allowlist checks, GET cookie rejection, timeout aliases and caps, concurrency (`429`), stderr/output-size caps, `--` argument termination, process-group kills (timeout and cancellation) and bounded pipe drains without touching the network.
 
 Smoke-tested end to end against public media (2026-10-27):
 
