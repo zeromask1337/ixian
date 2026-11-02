@@ -1,0 +1,22 @@
+services:
+  ixian:
+    image: ghcr.io/zeromask1337/ixian:latest
+    # build: .
+    container_name: ixian
+    # --init equivalent: reap zombies left by yt-dlp/ffmpeg and forward SIGTERM.
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      RUST_LOG: ixian=info,tower_http=info
+    # Downloads land in /tmp; a named volume keeps large files off the container layer.
+    # ixian reaps stale ixian-* dirs at boot and every hour.
+    volumes:
+      - ixian-tmp:/tmp
+    # Give in-flight requests time to drain before Docker sends SIGKILL.
+    stop_grace_period: 30s
+    # The image already defines HEALTHCHECK against /healthz; it is inherited here.
+
+volumes:
+  ixian-tmp:
