@@ -68,7 +68,11 @@ For a bind mount, make it writable by the container user (uid/gid `1000`):
 | --- | --- |
 | `url` | **required** video URL; must be `http(s)` and match a supported platform host |
 | `platform` | optional override: `youtube`, `x`, `instagram`, `tiktok` (otherwise detected from the URL). The URL must still belong to that platform |
-| `format` | optional yt-dlp format selector (default: best mp4) |
+| `mode` | `video` (default) or `audio`; audio extracts m4a (`audio/mp4`) |
+| `quality` | `best` (default), `1080`, `720`, `480`, or `data`; mapped server-side to a height cap |
+| `container` | `mp4` (default) or `webm`; sets `--merge-output-format` |
+| `item` | playlist item to return, 1-based (default `1`) |
+| `format` | optional yt-dlp format selector; overrides `quality` (advanced escape hatch) |
 | `timeout_ms` | optional download timeout in milliseconds (default `600000`, or `YTDLP_TIMEOUT_MS`); `timeoutMs` is accepted as an alias |
 | `inline` | `1` serves `content-disposition: inline` for browser playback (default: attachment) |
 
@@ -104,6 +108,30 @@ jq -n --rawfile c cookies.txt \
   curl -X POST http://127.0.0.1:3000/download \
     -H 'content-type: application/json' --data-binary @- -o video.mp4
 ```
+
+### `GET/POST /info`
+
+Probes a URL with `yt-dlp -J --no-playlist --playlist-items 1` and returns trimmed
+metadata without downloading. Accepts the same `url`, `platform` and `timeout_ms`
+params as `/download`; cookies go in the `POST` body like `/download` and stored
+cookies are used automatically. The probe uses a shorter default timeout
+(`YTDLP_INFO_TIMEOUT_MS`, 15 s).
+
+```json
+{
+  "title": "Example",
+  "duration": 42.5,
+  "thumbnail": "https://…/maxresdefault.jpg",
+  "uploader": "Channel",
+  "is_live": false,
+  "formats": [
+    { "height": 1080, "ext": "mp4", "vcodec": "avc1.640028", "acodec": "none", "filesize": 123456 }
+  ]
+}
+```
+
+Only the fields above are exposed; format URLs and IDs are dropped. `/info` is
+not cached and does not count toward the download cache size.
 
 ### Cookie formats
 
@@ -150,9 +178,10 @@ curl -X DELETE http://127.0.0.1:3000/cookies/youtube
 ### Cache
 
 Downloads are cached on disk. The key is
-`SHA-256(platform + normalized URL + format + cookie fingerprint)`, so tracking
+`SHA-256(platform + normalized URL + format + mode/quality/container/item + cookie fingerprint)`, so tracking
 params, `youtu.be`/`twitter.com` aliases and query order do not cause duplicate
-downloads. Requests that send cookies are cached under a hash of the cookies,
+downloads, while audio, quality presets, containers and playlist items each get
+their own entry. Requests that send cookies are cached under a hash of the cookies,
 never the cookie contents; cookies auto-loaded from the [cookie store](#cookie-store)
 are part of the key too.
 
@@ -171,8 +200,8 @@ require `Authorization: Bearer <token>` (or `x-ixian-token: <token>`).
 
 ### Response
 
-- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform`, `Cache-Control: private`, `ETag`, `Accept-Ranges: bytes`); cache hits also answer `Range`, `HEAD` and `If-None-Match` (`304`). `inline=1` (or `"inline": true` in JSON) switches to `content-disposition: inline` for browser playback. Temp files are cleaned up after streaming.
-- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request, including cookies on `GET` and URLs outside the platform allowlist), `401` (cookie write or cache admin without a valid `IXIAN_TOKEN`), `404`, `405`, `413` (cookie too large), `429` (too many concurrent downloads), `502` (yt-dlp failed/timeout), `500`.
+- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform`, `Cache-Control: private`, `ETag`, `Accept-Ranges: bytes`); cache hits also answer `Range`, `HEAD` and `If-None-Match` (`304`). `inline=1` (or `"inline": true` in JSON) switches to `content-disposition: inline` for browser playback. Audio mode always returns `content-type: audio/mp4`. Temp files are cleaned up after streaming.
+- Errors: JSON `{ "error": "...", "code": 404, "hint": "..." }`; `code` mirrors the HTTP status. Request validation uses `400` (bad request, including cookies on `GET` and URLs outside the platform allowlist), `401` (cookie write or cache admin without a valid `IXIAN_TOKEN`), `404`, `405`, `413` (cookie too large), `429` (too many concurrent downloads), `500`. yt-dlp stderr is classified into `400` (bad URL/format), `401` (login/cookies), `403` (private/members-only), `404` (deleted/unavailable), `429` (rate limited by the platform), `451` (geo-blocked), `504` (timeout), with `502` for unclassified failures.
 
 ### Limits
 
@@ -224,7 +253,7 @@ Publishing the release also triggers the `Publish image` workflow, which builds 
 gh workflow run publish-image.yml -f tag=v0.1.1
 ```
 
-Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors and Cloudflare Access pages show as alerts.
+Flow: share a link (or copy one and run from the menu bar) -> choose **Best / 720p / Audio / Data saver** -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors show the classified error plus its hint; Cloudflare Access pages show as alerts.
 
 ## Config (env)
 
@@ -234,8 +263,9 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 | `HOST` | `127.0.0.1` | listen host (only local by default) |
 | `YTDLP_PATH` | `yt-dlp` | yt-dlp binary |
 | `YTDLP_PLUGIN_DIR` | `<repo>/yt-dlp-plugins` | yt-dlp plugin directory (skipped when missing) |
-| `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | default format when `format` is not passed |
+| `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | selector for `quality=best` when `format` is not passed |
 | `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout (capped at `MAX_TIMEOUT_MS`) |
+| `YTDLP_INFO_TIMEOUT_MS` | `15000` | default `/info` probe timeout |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
 | `IXIAN_COOKIE_DIR` | unset | cookie store directory (Docker: `/data/cookies`); auto-loads `<platform>.txt` and enables cookie writes |
@@ -247,8 +277,8 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 ## Notes
 
 - The whole server is one file (`src/main.rs`) built on `axum`, `tokio::process` and `tokio::fs`; the only external runtime dependencies are `yt-dlp` and `ffmpeg`.
-- The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself.
-- Playlists are disabled (`--no-playlist` plus `--playlist-items 1`): one URL yields one file. For an X post that quotes another post (or carries several videos), the linked post's first video is returned, not the quoted/original one.
+- The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself. `quality` caps height server-side; `format` is the advanced escape hatch and wins over `quality`.
+- Playlists are disabled (`--no-playlist` plus `--playlist-items N`): one URL yields one file. `item=N` picks the Nth video; by default the linked post's first video is returned, not the quoted/original one.
 - Downloads are staged in a unique temp directory. With caching enabled the media is hard-linked/copied into `IXIAN_CACHE_DIR` and served from there; without a cached copy the temp file is streamed and then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
 - Instagram: some networks drop TLS for `*.instagram.com` and geo-picked CDN edges. Two bundled yt-dlp plugins work around that:
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
@@ -264,7 +294,7 @@ cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests exercise streaming, temp-file cleanup, cookie jar generation and permissions (temp dir `0700`, jar `0600`), cookie store auto-load/override/atomic write, URL/platform allowlist checks, GET cookie rejection, timeout aliases and caps, concurrency (`429`), stderr/output-size caps, `--` argument termination, process-group kills (timeout and cancellation), yt-dlp failures and bounded pipe drains without touching the network. Cache tests cover hit/miss, URL normalization, `Range`, `HEAD`, `304`, concurrent same-key dedupe, LRU eviction and admin auth.
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation and permissions (temp dir `0700`, jar `0600`), cookie store auto-load/override/atomic write, URL/platform allowlist checks, GET cookie rejection, timeout aliases and caps, concurrency (`429`), stderr/output-size caps, `--` argument termination, process-group kills (timeout and cancellation), yt-dlp failures and bounded pipe drains without touching the network. Preset tests cover audio extraction, quality/container selectors, playlist `item`, `/info` trimming and playlist entry selection, and classified `{code, hint}` errors. Cache tests cover hit/miss, URL normalization, `Range`, `HEAD`, `304`, concurrent same-key dedupe, LRU eviction and admin auth.
 
 Smoke-tested end to end against public media (2026-10-27):
 

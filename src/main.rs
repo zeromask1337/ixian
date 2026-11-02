@@ -41,6 +41,7 @@ use uuid::Uuid;
 const DEFAULT_FORMAT: &str = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4]/bv*+ba/b";
 const COOKIE_HINT: &str =
     "cookies may be invalid or incomplete; public posts download without cookies";
+const DEFAULT_INFO_TIMEOUT_MS: u64 = 15_000;
 const COOKIE_DIR_MODE: u32 = 0o700;
 const COOKIE_FILE_MODE: u32 = 0o600;
 const MAX_STORED_COOKIE_BYTES: usize = 1024 * 1024;
@@ -140,6 +141,157 @@ fn parse_platform(name: &str) -> Result<Platform, ApiError> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Video,
+    Audio,
+}
+
+impl Mode {
+    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
+        match value.filter(|value| !value.is_empty()) {
+            None => Ok(Mode::Video),
+            Some(value) if value.eq_ignore_ascii_case("video") => Ok(Mode::Video),
+            Some(value) if value.eq_ignore_ascii_case("audio") => Ok(Mode::Audio),
+            Some(value) => Err(ApiError::bad_request(format!(
+                "unknown mode '{value}' (expected: video, audio)"
+            ))),
+        }
+    }
+
+    fn is_audio(self) -> bool {
+        matches!(self, Mode::Audio)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Video => "video",
+            Mode::Audio => "audio",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quality {
+    Best,
+    P1080,
+    P720,
+    P480,
+    Data,
+}
+
+impl Quality {
+    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
+        match value.filter(|value| !value.is_empty()) {
+            None => Ok(Quality::Best),
+            Some(value) if value.eq_ignore_ascii_case("best") => Ok(Quality::Best),
+            Some("1080") => Ok(Quality::P1080),
+            Some("720") => Ok(Quality::P720),
+            Some("480") => Ok(Quality::P480),
+            Some(value) if value.eq_ignore_ascii_case("data") => Ok(Quality::Data),
+            Some(value) => Err(ApiError::bad_request(format!(
+                "unknown quality '{value}' (expected: best, 1080, 720, 480, data)"
+            ))),
+        }
+    }
+
+    fn selector(self, container: Container, default_format: &str) -> String {
+        let webm = container == Container::Webm;
+        match self {
+            Quality::Best if webm => concat!(
+                "bv*[vcodec^=vp9]+ba[acodec=opus]/",
+                "bv*[ext=webm]+ba/b[ext=webm]/bv*+ba/b"
+            )
+            .to_string(),
+            Quality::Best => default_format.to_string(),
+            Quality::P1080 => capped_selector(1080, webm),
+            Quality::P720 => capped_selector(720, webm),
+            Quality::P480 => capped_selector(480, webm),
+            Quality::Data if webm => "b[height<=480][ext=webm]/b[height<=480]/b".to_string(),
+            Quality::Data => "b[height<=480]/b".to_string(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Quality::Best => "best",
+            Quality::P1080 => "1080",
+            Quality::P720 => "720",
+            Quality::P480 => "480",
+            Quality::Data => "data",
+        }
+    }
+}
+
+fn capped_selector(height: u16, webm: bool) -> String {
+    if webm {
+        format!(
+            "bv*[height<={height}][vcodec^=vp9]+ba[acodec=opus]/\
+             bv*[height<={height}]+ba/b[height<={height}]/b"
+        )
+    } else {
+        format!(
+            "bv*[height<={height}][vcodec^=avc1]+ba[acodec^=mp4a]/\
+             bv*[height<={height}]+ba/b[height<={height}]/b"
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Container {
+    Mp4,
+    Webm,
+}
+
+impl Container {
+    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
+        match value.filter(|value| !value.is_empty()) {
+            None => Ok(Container::Mp4),
+            Some(value) if value.eq_ignore_ascii_case("mp4") => Ok(Container::Mp4),
+            Some(value) if value.eq_ignore_ascii_case("webm") => Ok(Container::Webm),
+            Some(value) => Err(ApiError::bad_request(format!(
+                "unknown container '{value}' (expected: mp4, webm)"
+            ))),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Container::Mp4 => "mp4",
+            Container::Webm => "webm",
+        }
+    }
+}
+
+fn parse_item(value: Option<&str>) -> Result<usize, ApiError> {
+    match value.filter(|value| !value.is_empty()) {
+        None => Ok(1),
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|item| *item > 0)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("invalid item '{value}' (expected a number >= 1)"))
+            }),
+    }
+}
+
+fn item_from_json(value: Option<&Value>) -> Result<usize, ApiError> {
+    match value {
+        None | Some(Value::Null) => Ok(1),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .and_then(|item| usize::try_from(item).ok())
+            .filter(|item| *item > 0)
+            .ok_or_else(|| ApiError::bad_request("invalid 'item' (expected a number >= 1)")),
+        Some(Value::String(value)) => parse_item(Some(value)),
+        Some(_) => Err(ApiError::bad_request(
+            "invalid 'item' (expected a number >= 1)",
+        )),
+    }
+}
+
 struct Config {
     host: String,
     port: u16,
@@ -147,6 +299,7 @@ struct Config {
     plugin_dir: Option<PathBuf>,
     format: String,
     timeout: Duration,
+    info_timeout: Duration,
     tmp: PathBuf,
     cache: Option<Cache>,
     cookie_dir: Option<PathBuf>,
@@ -173,6 +326,11 @@ impl Config {
             .ok()
             .and_then(|v| parse_ms(&v))
             .unwrap_or_else(|| Duration::from_millis(MAX_TIMEOUT_MS))
+            .min(Duration::from_millis(MAX_TIMEOUT_MS));
+        let info_timeout = env::var("YTDLP_INFO_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| parse_ms(&v))
+            .unwrap_or_else(|| Duration::from_millis(DEFAULT_INFO_TIMEOUT_MS))
             .min(Duration::from_millis(MAX_TIMEOUT_MS));
         let tmp = non_empty(env::var("TMPDIR").ok())
             .map(PathBuf::from)
@@ -216,6 +374,7 @@ impl Config {
             plugin_dir,
             format,
             timeout: timeout_ms,
+            info_timeout,
             tmp,
             cache,
             cookie_dir,
@@ -376,14 +535,22 @@ fn hash_component(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
-fn cache_key(platform: Platform, url: &str, format: &str, cookies: Option<&str>) -> String {
+fn cache_key(
+    platform: Platform,
+    url: &str,
+    format: &str,
+    variant: &str,
+    cookies: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hash_component(&mut hasher, b"ixian-cache-v1");
     hash_component(&mut hasher, platform.name().as_bytes());
     hash_component(&mut hasher, normalized_url(url).as_bytes());
     hash_component(&mut hasher, format.as_bytes());
-    // `mode` is part of the key so future response modes cannot collide.
+    // Output modes share a URL but not a file: mode/quality/container/item
+    // must not collide in the cache.
     hash_component(&mut hasher, b"download");
+    hash_component(&mut hasher, variant.as_bytes());
     hash_component(&mut hasher, cookie_fingerprint(cookies).as_bytes());
     hex_digest(&hasher.finalize())
 }
@@ -743,6 +910,14 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
+    fn classified(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            hint: Some(hint_for(status).to_string()),
+        }
+    }
+
     fn bad_request_with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -776,6 +951,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = Map::new();
         body.insert("error".into(), Value::String(self.message));
+        body.insert("code".into(), json!(self.status.as_u16()));
         if let Some(hint) = self.hint {
             body.insert("hint".into(), Value::String(hint));
         }
@@ -784,6 +960,138 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult = Result<Response, ApiError>;
+
+fn hint_for(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "check the url; pass the full post or video link",
+        StatusCode::UNAUTHORIZED => "sign in or pass cookies for this platform",
+        StatusCode::FORBIDDEN => {
+            "the post may be private or members-only; pass cookies with access"
+        }
+        StatusCode::NOT_FOUND => "the post or video may have been deleted or made private",
+        StatusCode::TOO_MANY_REQUESTS => "rate limited by the platform; wait and retry",
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => {
+            "not available in this region; try a different network"
+        }
+        StatusCode::GATEWAY_TIMEOUT => "yt-dlp timed out; retry or raise the timeout",
+        _ => "yt-dlp failed; check the url and try again",
+    }
+}
+
+fn classify_ytdlp_error(stderr: &str) -> Option<StatusCode> {
+    let text = stderr.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+
+    for (code, status) in [
+        ("429", StatusCode::TOO_MANY_REQUESTS),
+        ("451", StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS),
+        ("401", StatusCode::UNAUTHORIZED),
+        ("403", StatusCode::FORBIDDEN),
+        ("404", StatusCode::NOT_FOUND),
+        ("504", StatusCode::GATEWAY_TIMEOUT),
+        ("400", StatusCode::BAD_REQUEST),
+    ] {
+        if text.contains(&format!("http error {code}"))
+            || text.contains(&format!("status code {code}"))
+        {
+            return Some(status);
+        }
+    }
+
+    if has(&[
+        "too many requests",
+        "rate limit",
+        "rate-limit",
+        "rate limited",
+    ]) {
+        return Some(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if has(&[
+        "not available in your country",
+        "not available in your region",
+        "geo-restrict",
+        "geo restrict",
+        "geo-block",
+        "geo blocked",
+        "blocked in your country",
+        "unavailable for legal reasons",
+    ]) {
+        return Some(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+    }
+    if has(&[
+        "login required",
+        "sign in to",
+        "sign in required",
+        "authentication required",
+        "requires authentication",
+        "confirm your age",
+        "age-restricted",
+        "age restricted",
+        "cookies",
+        "logged-in",
+        "logged in",
+    ]) {
+        return Some(StatusCode::UNAUTHORIZED);
+    }
+    if has(&[
+        "private video",
+        "this video is private",
+        "members-only",
+        "members only",
+        "join this channel",
+        "subscriber",
+        "paid",
+        "purchase",
+    ]) {
+        return Some(StatusCode::FORBIDDEN);
+    }
+    if has(&[
+        "video unavailable",
+        "this video is unavailable",
+        "does not exist",
+        "no longer available",
+        "has been removed",
+        "removed by the uploader",
+        "not found",
+        "unable to find",
+        "no video",
+        "no media",
+    ]) {
+        return Some(StatusCode::NOT_FOUND);
+    }
+    if has(&["timed out", "timeout", "read timeout"]) {
+        return Some(StatusCode::GATEWAY_TIMEOUT);
+    }
+    if has(&[
+        "unsupported url",
+        "is not a valid url",
+        "invalid url",
+        "invalid request",
+        "no suitable format",
+        "requested format is not available",
+    ]) {
+        return Some(StatusCode::BAD_REQUEST);
+    }
+    None
+}
+
+fn ytdlp_failure(stderr: &str, status_code: Option<i32>, fallback_hint: Option<&str>) -> ApiError {
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        match status_code {
+            Some(code) => format!("yt-dlp exited with code {code}"),
+            None => "yt-dlp was terminated by a signal".to_string(),
+        }
+    };
+    match classify_ytdlp_error(&detail) {
+        Some(status) => ApiError::classified(status, detail),
+        None => ApiError::bad_gateway(
+            detail,
+            Some(fallback_hint.unwrap_or_else(|| hint_for(StatusCode::BAD_GATEWAY))),
+        ),
+    }
+}
 
 /// Parses and validates a request URL, returning the cleaned URL (stray
 /// backslashes removed) and the platform it belongs to. A `platform` override
@@ -1029,12 +1337,13 @@ fn system_time_secs(time: SystemTime) -> Option<u64> {
 
 /// yt-dlp prints one filepath per downloaded item. A tweet that quotes another
 /// tweet (or carries several videos) is a playlist: the linked tweet's own
-/// media comes first, the referenced tweet's video after it. Keep the first path.
-fn primary_filepath(stdout: &str) -> Option<PathBuf> {
+/// media comes first, the referenced tweet's video after it. `item` is 1-based.
+fn nth_filepath(stdout: &str, item: usize) -> Option<PathBuf> {
     stdout
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .filter(|line| !line.is_empty())
+        .nth(item.saturating_sub(1))
         .map(PathBuf::from)
 }
 
@@ -1113,8 +1422,32 @@ struct DownloadRequest {
     platform: Platform,
     cookies: Option<String>,
     format: Option<String>,
+    mode: Mode,
+    quality: Quality,
+    container: Container,
+    item: usize,
     timeout: Option<Duration>,
     inline: bool,
+}
+
+impl DownloadRequest {
+    /// Cache partition for the output shape. `format` is hashed separately.
+    fn cache_variant(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.mode.name(),
+            self.quality.name(),
+            self.container.name(),
+            self.item
+        )
+    }
+}
+
+struct InfoRequest {
+    url: String,
+    platform: Platform,
+    cookies: Option<String>,
+    timeout: Option<Duration>,
 }
 
 /// A completed yt-dlp download, still inside its per-download temp directory.
@@ -1263,6 +1596,93 @@ impl AsyncRead for TempFileReader {
     }
 }
 
+struct YtdlpOutput {
+    success: bool,
+    status_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs yt-dlp in its own process group with bounded pipe capture and a hard
+/// timeout. A non-zero exit is returned as data so callers can classify stderr.
+async fn run_ytdlp(mut command: Command, limit: Duration) -> Result<YtdlpOutput, ApiError> {
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(|error| {
+        ApiError::bad_gateway(
+            format!("failed to run yt-dlp: {error}"),
+            Some(hint_for(StatusCode::BAD_GATEWAY)),
+        )
+    })?;
+    let mut group = ProcessGroup::new(child.id());
+
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stdout"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stderr"))?;
+    let stdout_task = tokio::spawn(async move {
+        let mut text = String::new();
+        stdout_pipe.read_to_string(&mut text).await.map(|_| text)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut limited = stderr_pipe.take(MAX_STDERR_BYTES as u64);
+        limited.read_to_end(&mut buf).await.map(|_| {
+            let text = String::from_utf8_lossy(&buf);
+            truncate_to_bytes(text.trim_end().to_string(), MAX_STDERR_BYTES)
+        })
+    });
+
+    let status = match timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            group.kill();
+            return Err(ApiError::bad_gateway(
+                format!("failed to wait for yt-dlp: {error}"),
+                Some(hint_for(StatusCode::BAD_GATEWAY)),
+            ));
+        }
+        Err(_) => {
+            group.kill();
+            if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
+                group.disarm();
+            }
+            // Do not wait on the pipes: yt-dlp's children (ffmpeg, curl) can keep them open.
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(ApiError::classified(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("yt-dlp timed out after {}ms", limit.as_millis()),
+            ));
+        }
+    };
+
+    // yt-dlp exited, but a grandchild may still hold the pipes open.
+    let ((stdout, stdout_stalled), (stderr, stderr_stalled)) =
+        tokio::join!(drain_pipe(stdout_task), drain_pipe(stderr_task));
+    if stdout_stalled || stderr_stalled {
+        group.kill();
+    }
+    group.disarm();
+
+    Ok(YtdlpOutput {
+        success: status.success(),
+        status_code: status.code(),
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    })
+}
+
 async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedMedia, ApiError> {
     let platform = request.platform;
     let url = request.url.replace('\\', "");
@@ -1308,18 +1728,24 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
             .map_err(|error| ApiError::internal(format!("cannot write cookie jar: {error}")))?;
     }
 
+    let selector = request.format.clone().unwrap_or_else(|| {
+        if request.mode.is_audio() {
+            "ba/b".to_string()
+        } else {
+            request.quality.selector(request.container, &config.format)
+        }
+    });
+
     let mut cmd = Command::new(&config.ytdlp);
     cmd.arg("--no-playlist")
         // `--no-playlist` does not collapse tweets that reference other tweets
-        // (yt-dlp returns them as a playlist), so pin the first item explicitly.
+        // (yt-dlp returns them as a playlist), so pin the requested item explicitly.
         .arg("--playlist-items")
-        .arg("1")
+        .arg(request.item.to_string())
         .arg("--no-progress")
         .arg("--no-simulate")
         .arg("--print")
         .arg("after_move:filepath")
-        .arg("--merge-output-format")
-        .arg("mp4")
         .arg("--socket-timeout")
         .arg(SOCKET_TIMEOUT_SECS.to_string())
         .arg("--retries")
@@ -1327,100 +1753,45 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
         .arg("--max-filesize")
         .arg(config.max_filesize.to_string())
         .arg("-f")
-        .arg(request.format.as_deref().unwrap_or(&config.format))
+        .arg(&selector)
         .arg("-o")
         .arg(dir.join("%(title)s [%(id)s].%(ext)s"));
+    if request.mode.is_audio() {
+        cmd.arg("-x")
+            .arg("--audio-format")
+            .arg("m4a")
+            .arg("--audio-quality")
+            .arg("0");
+    } else {
+        cmd.arg("--merge-output-format")
+            .arg(request.container.name());
+    }
     if let Some(plugin_dir) = &config.plugin_dir {
         cmd.arg("--plugin-dirs").arg(plugin_dir);
     }
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
     if has_cookies {
         cmd.arg("--cookies").arg(&jar);
     }
     // `--` terminates option parsing so a leading dash can never become a flag.
     cmd.arg("--").arg(&url);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|error| ApiError::bad_gateway(format!("failed to run yt-dlp: {error}"), None))?;
-    let mut group = ProcessGroup::new(child.id());
-
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stdout"))?;
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stderr"))?;
-    let stdout_task = tokio::spawn(async move {
-        let mut text = String::new();
-        stdout_pipe.read_to_string(&mut text).await.map(|_| text)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let mut limited = stderr_pipe.take(MAX_STDERR_BYTES as u64);
-        limited.read_to_end(&mut buf).await.map(|_| {
-            let text = String::from_utf8_lossy(&buf);
-            truncate_to_bytes(text.trim_end().to_string(), MAX_STDERR_BYTES)
-        })
-    });
-
     let limit = request.timeout.unwrap_or(config.timeout);
-    let status = match timeout(limit, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            group.kill();
-            return Err(ApiError::bad_gateway(
-                format!("failed to wait for yt-dlp: {error}"),
-                hint,
-            ));
-        }
-        Err(_) => {
-            group.kill();
-            if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
-                group.disarm();
-            }
-            // Do not wait on the pipes: yt-dlp's children (ffmpeg, curl) can keep them open.
-            stdout_task.abort();
-            stderr_task.abort();
-            return Err(ApiError::bad_gateway(
-                format!("yt-dlp timed out after {}ms", limit.as_millis()),
-                hint,
-            ));
-        }
-    };
-
-    // yt-dlp exited, but a grandchild may still hold the pipes open.
-    let ((stdout, stdout_stalled), (stderr, stderr_stalled)) =
-        tokio::join!(drain_pipe(stdout_task), drain_pipe(stderr_task));
-    if stdout_stalled || stderr_stalled {
-        group.kill();
+    let output = run_ytdlp(cmd, limit).await?;
+    if !output.success {
+        return Err(ytdlp_failure(&output.stderr, output.status_code, hint));
     }
-    group.disarm();
-    let stdout = stdout.unwrap_or_default();
-    let stderr = stderr.unwrap_or_default();
 
-    let path = primary_filepath(&stdout);
-    let media = match path {
-        Some(path) if status.success() => path,
-        _ => {
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                match status.code() {
-                    Some(code) => format!("yt-dlp exited with code {code}"),
-                    None => "yt-dlp was terminated by a signal".to_string(),
-                }
-            };
-            return Err(ApiError::bad_gateway(detail, hint));
-        }
-    };
+    // `--playlist-items N` normally yields one path (the selected item). Some
+    // extractors still print several, so prefer the Nth and fall back to the
+    // only path yt-dlp produced.
+    let media = nth_filepath(&output.stdout, request.item)
+        .or_else(|| nth_filepath(&output.stdout, 1))
+        .ok_or_else(|| {
+            ApiError::bad_gateway(
+                format!("yt-dlp did not produce item {}", request.item),
+                hint,
+            )
+        })?;
 
     let metadata = fs::metadata(&media)
         .await
@@ -1445,19 +1816,153 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
     let name = media
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("video")
+        .unwrap_or(if request.mode.is_audio() {
+            "audio"
+        } else {
+            "video"
+        })
         .to_string();
-    let mime = mime_guess::from_path(&media).first_or_octet_stream();
+    let mime = if request.mode.is_audio() {
+        "audio/mp4".to_string()
+    } else {
+        mime_guess::from_path(&media)
+            .first_or_octet_stream()
+            .to_string()
+    };
 
     Ok(DownloadedMedia {
         path: media,
         name,
-        mime: mime.as_ref().to_string(),
+        mime,
         size: metadata.len(),
         platform,
         hint,
         cleanup,
         permit,
+    })
+}
+
+async fn info(config: &Config, request: InfoRequest) -> Result<Json<Value>, ApiError> {
+    let InfoRequest {
+        url,
+        platform,
+        cookies,
+        timeout: request_timeout,
+    } = request;
+    let url = url.replace('\\', "");
+    let cookies = cookies.filter(|cookies| !cookies.trim().is_empty());
+    if cookies
+        .as_deref()
+        .is_some_and(|cookies| cookies.len() > MAX_COOKIE_BYTES)
+    {
+        return Err(ApiError::too_large(format!(
+            "cookies exceed the {MAX_COOKIE_BYTES} byte limit"
+        )));
+    }
+    let cookies = match cookies {
+        Some(cookies) => Some(cookies),
+        None => stored_cookies(config, platform).await?,
+    };
+    let has_cookies = cookies.is_some();
+    let hint = has_cookies.then_some(COOKIE_HINT);
+    let _permit = config.downloads.clone().try_acquire_owned().map_err(|_| {
+        ApiError::too_many_requests(format!(
+            "too many concurrent downloads (limit: {MAX_CONCURRENT})"
+        ))
+    })?;
+
+    let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
+    create_private_dir(&dir)
+        .map_err(|error| ApiError::internal(format!("cannot create temp directory: {error}")))?;
+    let jar = dir.join("cookies.txt");
+    let _cleanup = Cleanup::new(dir.clone());
+    if let Some(cookies) = cookies.as_deref() {
+        let contents = cookie_file(cookies, platform);
+        if contents.len() > MAX_STORED_COOKIE_BYTES {
+            return Err(ApiError::too_large(format!(
+                "cookies exceed the {MAX_STORED_COOKIE_BYTES} byte limit"
+            )));
+        }
+        write_cookie_jar(&jar, &contents)
+            .map_err(|error| ApiError::internal(format!("cannot write cookie jar: {error}")))?;
+    }
+
+    let mut cmd = Command::new(&config.ytdlp);
+    cmd.arg("-J")
+        .arg("--no-playlist")
+        .arg("--playlist-items")
+        .arg("1")
+        .arg("--no-progress")
+        .arg("--socket-timeout")
+        .arg(SOCKET_TIMEOUT_SECS.to_string())
+        .arg("--retries")
+        .arg(RETRIES.to_string());
+    if let Some(plugin_dir) = &config.plugin_dir {
+        cmd.arg("--plugin-dirs").arg(plugin_dir);
+    }
+    if has_cookies {
+        cmd.arg("--cookies").arg(&jar);
+    }
+    // `--` terminates option parsing so a leading dash can never become a flag.
+    cmd.arg("--").arg(&url);
+
+    let limit = request_timeout.unwrap_or(config.info_timeout);
+    let output = run_ytdlp(cmd, limit).await?;
+    if !output.success {
+        return Err(ytdlp_failure(&output.stderr, output.status_code, hint));
+    }
+
+    let parsed: Value = serde_json::from_str(output.stdout.trim()).map_err(|_| {
+        ApiError::bad_gateway(
+            "yt-dlp returned invalid JSON",
+            Some("the url may not be a single video; try the full post link"),
+        )
+    })?;
+    Ok(Json(trim_info(&parsed)))
+}
+
+fn field(value: &Value, key: &str) -> Value {
+    value.get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn info_entry(value: &Value) -> &Value {
+    value
+        .get("entries")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.iter().find(|entry| entry.is_object()))
+        .unwrap_or(value)
+}
+
+fn trim_formats(entry: &Value) -> Vec<Value> {
+    entry
+        .get("formats")
+        .and_then(Value::as_array)
+        .map(|formats| {
+            formats
+                .iter()
+                .map(|format| {
+                    json!({
+                        "height": field(format, "height"),
+                        "ext": field(format, "ext"),
+                        "vcodec": field(format, "vcodec"),
+                        "acodec": field(format, "acodec"),
+                        "filesize": field(format, "filesize"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn trim_info(value: &Value) -> Value {
+    let entry = info_entry(value);
+    json!({
+        "title": field(entry, "title"),
+        "duration": field(entry, "duration"),
+        "thumbnail": field(entry, "thumbnail"),
+        "uploader": field(entry, "uploader"),
+        "is_live": entry.get("is_live").cloned().unwrap_or(Value::Bool(false)),
+        "formats": trim_formats(entry),
     })
 }
 
@@ -1483,6 +1988,7 @@ async fn download(
         request.platform,
         &request.url,
         format,
+        &request.cache_variant(),
         effective_cookies.as_deref(),
     );
     let key_lock = cache.key_lock(&key);
@@ -1642,6 +2148,10 @@ async fn download_get(
                 .get("format")
                 .filter(|format| !format.is_empty())
                 .cloned(),
+            mode: Mode::parse(params.get("mode").map(String::as_str))?,
+            quality: Quality::parse(params.get("quality").map(String::as_str))?,
+            container: Container::parse(params.get("container").map(String::as_str))?,
+            item: parse_item(params.get("item").map(String::as_str))?,
             timeout,
             inline: params.get("inline").is_some_and(|value| parse_bool(value)),
         },
@@ -1698,11 +2208,96 @@ async fn download_post(
                 .and_then(Value::as_str)
                 .filter(|format| !format.is_empty())
                 .map(str::to_string),
+            mode: Mode::parse(object.get("mode").and_then(Value::as_str))?,
+            quality: Quality::parse(object.get("quality").and_then(Value::as_str))?,
+            container: Container::parse(object.get("container").and_then(Value::as_str))?,
+            item: item_from_json(object.get("item"))?,
             timeout,
             inline: parse_bool_value(object.get("inline")),
         },
         method,
         headers,
+    )
+    .await
+}
+
+async fn info_get(State(config): State<Arc<Config>>, uri: Uri) -> Result<Json<Value>, ApiError> {
+    let params: HashMap<String, String> =
+        url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+            .into_owned()
+            .collect();
+    if let Some((name, _)) = params
+        .iter()
+        .find(|(name, _)| GET_COOKIE_PARAMS.contains(&name.as_str()))
+    {
+        return Err(ApiError::bad_request_with_hint(
+            format!("'{name}' is not accepted in GET query strings"),
+            "send cookies in a POST /info JSON body instead",
+        ));
+    }
+
+    let url = params
+        .get("url")
+        .map(String::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing 'url' query parameter"))?;
+    let (url, platform) = validate_url(url, params.get("platform").map(String::as_str))?;
+    let timeout = query_timeout(&params)?;
+
+    info(
+        &config,
+        InfoRequest {
+            url,
+            platform,
+            cookies: None,
+            timeout,
+        },
+    )
+    .await
+}
+
+async fn info_post(
+    State(config): State<Arc<Config>>,
+    body: String,
+) -> Result<Json<Value>, ApiError> {
+    let parsed: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => serde_json::from_str(&sanitize_json_escapes(&body)).map_err(|_| {
+            ApiError::bad_request("invalid JSON body (check for stray escapes in the url)")
+        })?,
+    };
+    let object = parsed.as_object().ok_or_else(|| {
+        ApiError::bad_request("invalid JSON body (expected an object with a 'url' field)")
+    })?;
+
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing 'url' in JSON body"))?;
+    let (url, platform) = validate_url(url, object.get("platform").and_then(Value::as_str))?;
+    let timeout = json_timeout(object)?;
+
+    let cookies = object
+        .get("cookies")
+        .and_then(Value::as_object)
+        .and_then(|cookies| cookies.get(platform.name()))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .get(&format!("{}_cookies", platform.name()))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string);
+
+    info(
+        &config,
+        InfoRequest {
+            url,
+            platform,
+            cookies,
+            timeout,
+        },
     )
     .await
 }
@@ -1839,6 +2434,7 @@ fn app(config: Arc<Config>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/download", get(download_get).post(download_post))
+        .route("/info", get(info_get).post(info_post))
         .route("/cache/stats", get(cache_stats))
         .route("/cache", delete(cache_clear))
         .route("/cookies", get(list_cookies))
@@ -2027,16 +2623,127 @@ mod tests {
     }
 
     #[test]
-    fn picks_first_output_filepath() {
+    fn picks_nth_output_filepath() {
         assert_eq!(
-            primary_filepath("/tmp/a.mp4\n/tmp/b.mp4\n"),
+            nth_filepath("/tmp/a.mp4\n/tmp/b.mp4\n", 1),
             Some(PathBuf::from("/tmp/a.mp4"))
         );
         assert_eq!(
-            primary_filepath("\n  /tmp/a.mp4  \n"),
+            nth_filepath("\n  /tmp/a.mp4  \n", 1),
             Some(PathBuf::from("/tmp/a.mp4"))
         );
-        assert_eq!(primary_filepath(" \n\n"), None);
+        assert_eq!(
+            nth_filepath("/tmp/a.mp4\n/tmp/b.mp4\n", 2),
+            Some(PathBuf::from("/tmp/b.mp4"))
+        );
+        assert_eq!(nth_filepath("/tmp/a.mp4\n", 2), None);
+        assert_eq!(nth_filepath(" \n\n", 1), None);
+    }
+
+    #[test]
+    fn maps_quality_presets_to_selectors() {
+        let selector = |quality: Quality| quality.selector(Container::Mp4, DEFAULT_FORMAT);
+        assert_eq!(selector(Quality::Best), DEFAULT_FORMAT);
+        assert!(selector(Quality::P1080).contains("height<=1080"));
+        assert!(selector(Quality::P720).contains("height<=720"));
+        assert!(selector(Quality::P480).contains("height<=480"));
+        assert!(selector(Quality::Data).contains("height<=480"));
+        assert!(Quality::Best
+            .selector(Container::Webm, DEFAULT_FORMAT)
+            .contains("webm"));
+    }
+
+    #[test]
+    fn parses_modes_qualities_containers_and_items() {
+        assert_eq!(Mode::parse(None).unwrap(), Mode::Video);
+        assert_eq!(Mode::parse(Some("audio")).unwrap(), Mode::Audio);
+        assert!(Mode::parse(Some("video ")).is_err());
+
+        assert_eq!(Quality::parse(Some("720")).unwrap(), Quality::P720);
+        assert_eq!(Quality::parse(Some("data")).unwrap(), Quality::Data);
+        assert!(Quality::parse(Some("144")).is_err());
+
+        assert_eq!(Container::parse(Some("webm")).unwrap(), Container::Webm);
+        assert!(Container::parse(Some("mkv")).is_err());
+
+        assert_eq!(parse_item(None).unwrap(), 1);
+        assert_eq!(parse_item(Some("2")).unwrap(), 2);
+        assert!(parse_item(Some("0")).is_err());
+        assert!(parse_item(Some("x")).is_err());
+        assert_eq!(item_from_json(Some(&json!(3))).unwrap(), 3);
+        assert!(item_from_json(Some(&json!(0))).is_err());
+    }
+
+    #[test]
+    fn trims_info_metadata_and_formats() {
+        let info = json!({
+            "_type": "playlist",
+            "entries": [{
+                "title": "Example",
+                "duration": 42.5,
+                "thumbnail": "https://img.example/x.jpg",
+                "uploader": "Channel",
+                "is_live": false,
+                "formats": [{
+                    "format_id": "137",
+                    "height": 1080,
+                    "ext": "mp4",
+                    "vcodec": "avc1.640028",
+                    "acodec": "none",
+                    "filesize": 123,
+                    "url": "https://secret.example/video"
+                }]
+            }]
+        });
+
+        let trimmed = trim_info(&info);
+        assert_eq!(trimmed["title"], "Example");
+        assert_eq!(trimmed["duration"], 42.5);
+        assert_eq!(trimmed["thumbnail"], "https://img.example/x.jpg");
+        assert_eq!(trimmed["uploader"], "Channel");
+        assert_eq!(trimmed["is_live"], false);
+        assert_eq!(trimmed["formats"][0]["height"], 1080);
+        assert_eq!(trimmed["formats"][0]["ext"], "mp4");
+        assert_eq!(trimmed["formats"][0]["filesize"], 123);
+        assert!(trimmed["formats"][0].get("url").is_none());
+        assert!(trimmed["formats"][0].get("format_id").is_none());
+    }
+
+    #[test]
+    fn classifies_ytdlp_errors() {
+        let cases = [
+            (
+                "ERROR: HTTP Error 400: Bad Request",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "ERROR: Sign in to confirm your age",
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("ERROR: This video is private", StatusCode::FORBIDDEN),
+            ("ERROR: Video unavailable", StatusCode::NOT_FOUND),
+            (
+                "ERROR: HTTP Error 429: Too Many Requests",
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                "ERROR: not available in your country",
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            ),
+            (
+                "ERROR: HTTP Error 504: Gateway Timeout",
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+        ];
+        for (stderr, status) in cases {
+            let error = ytdlp_failure(stderr, Some(1), None);
+            assert_eq!(error.status, status, "{stderr}");
+            assert!(error.hint.is_some(), "{stderr}");
+        }
+
+        let error = ytdlp_failure("extractor exploded", Some(1), None);
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.hint.is_some());
     }
 
     #[test]
@@ -2134,11 +2841,12 @@ mod tests {
     }
 
     #[test]
-    fn cache_keys_cover_cookies_and_format() {
+    fn cache_keys_cover_cookies_format_and_variant() {
         let base = cache_key(
             Platform::YouTube,
             "https://youtu.be/abc",
             DEFAULT_FORMAT,
+            "video:best:mp4:1",
             None,
         );
         assert_eq!(
@@ -2147,6 +2855,7 @@ mod tests {
                 Platform::YouTube,
                 "https://www.youtube.com/watch?v=abc&utm_source=share",
                 DEFAULT_FORMAT,
+                "video:best:mp4:1",
                 Some("")
             )
         );
@@ -2156,13 +2865,38 @@ mod tests {
                 Platform::YouTube,
                 "https://youtu.be/abc",
                 DEFAULT_FORMAT,
+                "video:best:mp4:1",
                 Some("auth_token=secret")
             )
         );
         assert_ne!(
             base,
-            cache_key(Platform::YouTube, "https://youtu.be/abc", "bv*+ba/b", None)
+            cache_key(
+                Platform::YouTube,
+                "https://youtu.be/abc",
+                "bv*+ba/b",
+                "video:best:mp4:1",
+                None
+            )
         );
+        for variant in [
+            "audio:best:mp4:1",
+            "video:720:mp4:1",
+            "video:best:webm:1",
+            "video:best:mp4:2",
+        ] {
+            assert_ne!(
+                base,
+                cache_key(
+                    Platform::YouTube,
+                    "https://youtu.be/abc",
+                    DEFAULT_FORMAT,
+                    variant,
+                    None
+                ),
+                "{variant}"
+            );
+        }
     }
 
     #[test]
@@ -2205,10 +2939,13 @@ LOG="{log_dir}"
 out=""
 prev=""
 jar=""
+ext="mp4"
 for arg in "$@"; do
   case "$prev" in
     -o) out="$arg" ;;
     --cookies) jar="$arg" ;;
+    --merge-output-format) ext="$arg" ;;
+    --audio-format) ext="$arg" ;;
   esac
   prev="$arg"
 done
@@ -2221,8 +2958,18 @@ dir="${{prefix%/}}"
 mode=$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir")
 printf '%s\n' "$mode" > "$LOG/dirmode.txt"
 printf 'partial' > "${{prefix}}partial.part"
-printf 'fake video data' > "${{prefix}}fake.mp4"
-printf '%s\n' "${{prefix}}fake.mp4"
+if [ -f "$LOG/items" ]; then
+  n=$(cat "$LOG/items")
+  i=1
+  while [ "$i" -le "$n" ]; do
+    printf 'item %s' "$i" > "${{prefix}}item${{i}}.${{ext}}"
+    printf '%s\n' "${{prefix}}item${{i}}.${{ext}}"
+    i=$((i+1))
+  done
+  exit 0
+fi
+printf 'fake video data' > "${{prefix}}fake.${{ext}}"
+printf '%s\n' "${{prefix}}fake.${{ext}}"
 "#
                 ),
             )
@@ -2234,6 +2981,24 @@ printf '%s\n' "${{prefix}}fake.mp4"
         fn config(&self, timeout: Duration) -> Arc<Config> {
             self.config_full(
                 timeout,
+                timeout,
+                None,
+                None,
+                None,
+                None,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
+        }
+
+        fn config_with_info_timeout(
+            &self,
+            timeout: Duration,
+            info_timeout: Duration,
+        ) -> Arc<Config> {
+            self.config_full(
+                timeout,
+                info_timeout,
                 None,
                 None,
                 None,
@@ -2249,6 +3014,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             plugin_dir: Option<PathBuf>,
         ) -> Arc<Config> {
             self.config_full(
+                timeout,
                 timeout,
                 plugin_dir,
                 None,
@@ -2266,6 +3032,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             token: Option<&str>,
         ) -> Arc<Config> {
             self.config_full(
+                timeout,
                 timeout,
                 None,
                 Some(cookie_dir),
@@ -2285,6 +3052,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
         ) -> Arc<Config> {
             self.config_full(
                 timeout,
+                timeout,
                 plugin_dir,
                 None,
                 None,
@@ -2296,6 +3064,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
 
         fn config_with_cache(&self, cache: Cache) -> Arc<Config> {
             self.config_full(
+                Duration::from_secs(30),
                 Duration::from_secs(30),
                 None,
                 None,
@@ -2315,6 +3084,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
         ) -> Arc<Config> {
             self.config_full(
                 timeout,
+                timeout,
                 plugin_dir,
                 None,
                 cache,
@@ -2328,6 +3098,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
         fn config_full(
             &self,
             timeout: Duration,
+            info_timeout: Duration,
             plugin_dir: Option<PathBuf>,
             cookie_dir: Option<PathBuf>,
             cache: Option<Cache>,
@@ -2342,6 +3113,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
                 plugin_dir,
                 format: DEFAULT_FORMAT.into(),
                 timeout,
+                info_timeout,
                 tmp: self.tmp.path().to_path_buf(),
                 cache,
                 cookie_dir,
@@ -2364,6 +3136,15 @@ printf '%s\n' "${{prefix}}fake.mp4"
             serializer.append_pair(name, value);
         }
         format!("/download?{}", serializer.finish())
+    }
+
+    fn arg_value(args: &str, flag: &str) -> String {
+        let lines: Vec<&str> = args.lines().collect();
+        let index = lines
+            .iter()
+            .position(|arg| *arg == flag)
+            .unwrap_or_else(|| panic!("missing {flag} in {args}"));
+        lines[index + 1].to_string()
     }
 
     fn process_alive(pid: u32) -> bool {
@@ -2522,6 +3303,228 @@ printf '%s\n' "${{prefix}}fake.mp4"
     }
 
     #[tokio::test]
+    async fn picks_requested_playlist_item() {
+        let harness = Harness::new("");
+        stdfs::write(harness.logs.path().join("items"), "3").unwrap();
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload =
+            serde_json::json!({ "url": "https://x.com/user/status/1", "item": 2 }).to_string();
+
+        let (status, headers, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let disposition = headers[header::CONTENT_DISPOSITION].to_str().unwrap();
+        assert!(disposition.contains("item2.mp4"), "{disposition}");
+        assert_eq!(body, b"item 2");
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        assert_eq!(arg_value(&args, "--playlist-items"), "2");
+    }
+
+    #[tokio::test]
+    async fn audio_mode_extracts_m4a() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({
+            "url": "https://www.youtube.com/watch?v=abc",
+            "mode": "audio",
+        })
+        .to_string();
+
+        let (status, headers, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE].to_str().unwrap(), "audio/mp4");
+        assert!(headers[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .contains("fake.m4a"));
+        assert_eq!(body, b"fake video data");
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        assert_eq!(arg_value(&args, "-f"), "ba/b");
+        assert!(args.lines().any(|arg| arg == "-x"), "{args}");
+        assert_eq!(arg_value(&args, "--audio-format"), "m4a");
+        assert_eq!(arg_value(&args, "--audio-quality"), "0");
+        assert!(
+            !args.lines().any(|arg| arg == "--merge-output-format"),
+            "{args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maps_quality_and_container_args() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        let payload = serde_json::json!({
+            "url": "https://youtu.be/abc",
+            "quality": "720",
+        })
+        .to_string();
+        let (status, _, _) = request(app.clone(), Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let selector = arg_value(&args, "-f");
+        assert!(selector.contains("height<=720"), "{selector}");
+        assert_eq!(arg_value(&args, "--merge-output-format"), "mp4");
+
+        let payload = serde_json::json!({
+            "url": "https://youtu.be/abc",
+            "container": "webm",
+        })
+        .to_string();
+        let (status, headers, _) =
+            request(app.clone(), Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_TYPE].to_str().unwrap(),
+            "video/webm"
+        );
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        assert_eq!(arg_value(&args, "--merge-output-format"), "webm");
+
+        let payload = serde_json::json!({
+            "url": "https://youtu.be/abc",
+            "quality": "720",
+            "format": "b[ext=webm]",
+        })
+        .to_string();
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        assert_eq!(arg_value(&args, "-f"), "b[ext=webm]");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_presets() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        for payload in [
+            json!({ "url": "https://youtu.be/abc", "mode": "radio" }),
+            json!({ "url": "https://youtu.be/abc", "quality": "144" }),
+            json!({ "url": "https://youtu.be/abc", "container": "mkv" }),
+            json!({ "url": "https://youtu.be/abc", "item": 0 }),
+        ] {
+            let (status, _, body) = request(
+                app.clone(),
+                Method::POST,
+                "/download",
+                Some(payload.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["code"], 400, "{payload}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probes_info_and_trims_formats() {
+        let info = serde_json::json!({
+            "title": "Example",
+            "duration": 42.5,
+            "thumbnail": "https://img.example/x.jpg",
+            "uploader": "Channel",
+            "is_live": false,
+            "formats": [{
+                "format_id": "137",
+                "height": 1080,
+                "ext": "mp4",
+                "vcodec": "avc1.640028",
+                "acodec": "none",
+                "filesize": 123,
+                "url": "https://secret.example/video"
+            }]
+        });
+        let harness = Harness::new(&format!("printf '%s' '{info}'\nexit 0"));
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        let (status, headers, body) = request(
+            app,
+            Method::GET,
+            "/info?url=https://www.youtube.com/watch?v=abc",
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_TYPE].to_str().unwrap(),
+            "application/json"
+        );
+        let info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["title"], "Example");
+        assert_eq!(info["duration"], 42.5);
+        assert_eq!(info["thumbnail"], "https://img.example/x.jpg");
+        assert_eq!(info["uploader"], "Channel");
+        assert_eq!(info["is_live"], false);
+        assert_eq!(info["formats"][0]["height"], 1080);
+        assert_eq!(info["formats"][0]["filesize"], 123);
+        assert!(info["formats"][0].get("url").is_none());
+        assert!(info["formats"][0].get("format_id").is_none());
+
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        assert_eq!(args.lines().next(), Some("-J"));
+        assert_eq!(arg_value(&args, "--playlist-items"), "1");
+    }
+
+    #[tokio::test]
+    async fn info_reads_first_playlist_entry() {
+        let info = serde_json::json!({
+            "_type": "playlist",
+            "entries": [
+                { "title": "First", "formats": [] },
+                { "title": "Second", "formats": [] }
+            ]
+        });
+        let harness = Harness::new(&format!("printf '%s' '{info}'\nexit 0"));
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://x.com/user/status/1" }).to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/info", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["title"], "First");
+    }
+
+    #[tokio::test]
+    async fn info_times_out_with_gateway_timeout() {
+        let harness = Harness::new("sleep 5");
+        let app =
+            app(harness
+                .config_with_info_timeout(Duration::from_secs(30), Duration::from_millis(100)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let started = std::time::Instant::now();
+        let (status, _, body) = request(app, Method::POST, "/info", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], 504);
+        assert!(error["hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn classifies_download_errors_with_code_and_hint() {
+        let harness = Harness::new("echo 'ERROR: [youtube] abc: Video unavailable' >&2; exit 1");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], 404);
+        assert!(error["hint"].is_string());
+    }
+
+    #[tokio::test]
     async fn reports_ytdlp_failures_as_bad_gateway() {
         let harness = Harness::new("echo 'extractor exploded' >&2; exit 1");
         let app = app(harness.config(Duration::from_secs(30)));
@@ -2554,13 +3557,14 @@ printf '%s\n' "${{prefix}}fake.mp4"
         let started = std::time::Instant::now();
         let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
 
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "{:?}",
             started.elapsed()
         );
         let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], 504);
         assert!(
             error["error"].as_str().unwrap().contains("timed out"),
             "{error}"
@@ -2921,7 +3925,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             let uri = query(&[("url", "https://youtu.be/abc"), (name, "100")]);
             let started = std::time::Instant::now();
             let (status, _, _) = request(app.clone(), Method::GET, &uri, None).await;
-            assert_eq!(status, StatusCode::BAD_GATEWAY, "GET {name}");
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "GET {name}");
             assert!(started.elapsed() < Duration::from_secs(2));
         }
 
@@ -2934,7 +3938,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             let started = std::time::Instant::now();
             let (status, _, _) =
                 request(app.clone(), Method::POST, "/download", Some(payload)).await;
-            assert_eq!(status, StatusCode::BAD_GATEWAY, "POST {name}");
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "POST {name}");
             assert!(started.elapsed() < Duration::from_secs(2));
         }
     }
@@ -3052,9 +4056,10 @@ printf '%s\n' "${{prefix}}fake.mp4"
         let started = std::time::Instant::now();
         let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
 
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert!(started.elapsed() < Duration::from_secs(3));
         let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], 504);
         assert!(
             error["error"].as_str().unwrap().contains("timed out"),
             "{error}"
@@ -3348,6 +4353,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
         let cache_dir = TempDir::new().unwrap();
         let cache = disk_cache(&cache_dir, None, Some(1024 * 1024));
         let app = app(harness.config_full(
+            Duration::from_secs(30),
             Duration::from_secs(30),
             None,
             Some(dir.clone()),
