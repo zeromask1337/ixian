@@ -28,8 +28,14 @@ RUN mkdir -p /home/node/.config/yt-dlp \
   && printf -- '--js-runtimes node\n' > /home/node/.config/yt-dlp/config \
   && chown -R node:node /home/node/.config
 
+# Persistent cookie store (mount a volume at /data/cookies).
+RUN mkdir -p /data/cookies \
+  && chown node:node /data/cookies \
+  && chmod 700 /data/cookies
+
 ENV YTDLP_PATH=/opt/yt-dlp/bin/yt-dlp \
     YTDLP_PLUGIN_DIR=/app/yt-dlp-plugins \
+    IXIAN_COOKIE_DIR=/data/cookies \
     HOST=0.0.0.0 \
     PORT=3000
 
