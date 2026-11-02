@@ -55,7 +55,11 @@ Any [config](#config-env) var can be overridden with `-e`, e.g. `-e YTDLP_FORMAT
 | `url` | **required** video URL |
 | `platform` | optional override: `youtube`, `x`, `instagram` (otherwise detected from the URL) |
 | `youtube_cookies` / `x_cookies` / `instagram_cookies` | cookies for that platform (only the matching one is used) |
-| `format` | optional yt-dlp format selector (default: best mp4) |
+| `mode` | `video` (default) or `audio`; audio extracts m4a (`audio/mp4`) |
+| `quality` | `best` (default), `1080`, `720`, `480`, or `data`; mapped server-side to a height cap |
+| `container` | `mp4` (default) or `webm`; sets `--merge-output-format` |
+| `item` | playlist item to return, 1-based (default `1`) |
+| `format` | optional yt-dlp format selector; overrides `quality` (advanced escape hatch) |
 | `timeout_ms` | optional download timeout (default `600000`, or `YTDLP_TIMEOUT_MS`) |
 
 ```sh
@@ -87,6 +91,25 @@ jq -n --rawfile c cookies.txt \
     -H 'content-type: application/json' --data-binary @- -o video.mp4
 ```
 
+### `GET/POST /info`
+
+Probes a URL with `yt-dlp -J --no-playlist --playlist-items 1` and returns trimmed metadata (no download):
+
+```json
+{
+  "title": "Example",
+  "duration": 42.5,
+  "thumbnail": "https://…/maxresdefault.jpg",
+  "uploader": "Channel",
+  "is_live": false,
+  "formats": [
+    { "height": 1080, "ext": "mp4", "vcodec": "avc1.640028", "acodec": "none", "filesize": 123456 }
+  ]
+}
+```
+
+Accepts the same `url`, `platform`, cookie and `timeout_ms` params as `/download`. Uses a shorter default timeout (`YTDLP_INFO_TIMEOUT_MS`, 15 s).
+
 ### Cookie formats
 
 The cookie parameter accepts either:
@@ -101,8 +124,8 @@ Cookies are written to a temp file (`chmod 600`), passed to yt-dlp via `--cookie
 
 ### Response
 
-- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform` header). Temp files are cleaned up after streaming.
-- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request), `404`, `405`, `502` (yt-dlp failed/timeout), `500`.
+- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform` header). Temp files are cleaned up after streaming. Audio mode always returns `content-type: audio/mp4`.
+- Errors: JSON `{ "error": "...", "code": 404, "hint": "..." }`. yt-dlp stderr is classified into `400` (bad URL/format), `401` (login/cookies), `403` (private/members-only), `404` (deleted/unavailable), `429` (rate limited), `451` (geo-blocked), `504` (timeout), plus `405` and `502`/`500` for other failures.
 
 ## Apple Shortcut
 
@@ -134,7 +157,7 @@ Publishing the release also triggers the `Publish image` workflow, which builds 
 gh workflow run publish-image.yml -f tag=v0.1.1
 ```
 
-Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors and Cloudflare Access pages show as alerts.
+Flow: share a link (or copy one and run from the menu bar) -> choose **Best / 720p / Audio / Data saver** -> POST `/download` -> menu: Save to Photos / Share / Save to Files. Server errors show the classified error plus its hint; Cloudflare Access pages show as alerts.
 
 ## Config (env)
 
@@ -144,8 +167,9 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 | `HOST` | `127.0.0.1` | listen host (only local by default) |
 | `YTDLP_PATH` | `yt-dlp` | yt-dlp binary |
 | `YTDLP_PLUGIN_DIR` | `<repo>/yt-dlp-plugins` | yt-dlp plugin directory (skipped when missing) |
-| `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | default format when `format` is not passed |
+| `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | selector for `quality=best` when `format` is not passed |
 | `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout |
+| `YTDLP_INFO_TIMEOUT_MS` | `15000` | default `/info` probe timeout |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
 
@@ -153,7 +177,7 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 
 - The whole server is one file (`src/main.rs`) built on `axum`, `tokio::process` and `tokio::fs`; the only external runtime dependencies are `yt-dlp` and `ffmpeg`.
 - The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself.
-- Playlists are disabled (`--no-playlist` plus `--playlist-items 1`): one URL yields one file. For an X post that quotes another post (or carries several videos), the linked post's first video is returned, not the quoted/original one.
+- Playlists are disabled (`--no-playlist` plus `--playlist-items N`): one URL yields one file. `item=N` picks the Nth video; by default the linked post's first video is returned, not the quoted/original one.
 - Downloads are saved to a unique temp file and streamed back, then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
 - Instagram: some networks drop TLS for `*.instagram.com` and geo-picked CDN edges. Two bundled yt-dlp plugins work around that:
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
