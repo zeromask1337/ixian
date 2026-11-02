@@ -2,12 +2,14 @@
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path as UrlPath, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{delete, get, put},
     Json, Router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     env,
@@ -15,7 +17,10 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, Weak,
+    },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -24,10 +29,12 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::TcpListener,
     process::Command,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 use tokio_util::io::ReaderStream;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 use url::Url;
 use uuid::Uuid;
 
@@ -45,6 +52,8 @@ const GET_COOKIE_PARAMS: [&str; 4] = [
     "tiktok_cookies",
 ];
 const STREAM_CHUNK: usize = 64 * 1024;
+const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_CONCURRENT: usize = 4;
 const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const MAX_COOKIE_BYTES: usize = 256 * 1024;
@@ -139,6 +148,7 @@ struct Config {
     format: String,
     timeout: Duration,
     tmp: PathBuf,
+    cache: Option<Cache>,
     cookie_dir: Option<PathBuf>,
     token: Option<String>,
     downloads: Arc<Semaphore>,
@@ -167,6 +177,32 @@ impl Config {
         let tmp = non_empty(env::var("TMPDIR").ok())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let cache_dir_env = env::var("IXIAN_CACHE_DIR").ok();
+        let cache_enabled = cache_dir_env
+            .as_deref()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "0" | "none" | "false"
+                )
+            })
+            .unwrap_or(true);
+        let cache = cache_enabled.then(|| {
+            let dir = non_empty(cache_dir_env)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| tmp.join("ixian-cache"));
+            let ttl_secs = env::var("CACHE_TTL")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CACHE_TTL_SECS);
+            let ttl = (ttl_secs > 0).then(|| Duration::from_secs(ttl_secs));
+            let max_bytes = env::var("CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CACHE_MAX_BYTES);
+            let max_bytes = (max_bytes > 0).then_some(max_bytes);
+            Cache::new(dir, ttl, max_bytes)
+        });
         let cookie_dir = non_empty(env::var("IXIAN_COOKIE_DIR").ok()).map(PathBuf::from);
         let token = env::var("IXIAN_TOKEN")
             .ok()
@@ -181,6 +217,7 @@ impl Config {
             format,
             timeout: timeout_ms,
             tmp,
+            cache,
             cookie_dir,
             token,
             downloads: Arc::new(Semaphore::new(MAX_CONCURRENT)),
@@ -191,6 +228,499 @@ impl Config {
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex_digest(&Sha256::digest(data))
+}
+
+fn cookie_fingerprint(cookies: Option<&str>) -> String {
+    match cookies.filter(|value| !value.is_empty()) {
+        Some(cookies) => sha256_hex(cookies.as_bytes()),
+        None => "anonymous".to_string(),
+    }
+}
+
+fn is_tracking_param(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("utm_")
+        || matches!(
+            name.as_str(),
+            "fbclid"
+                | "gclid"
+                | "igshid"
+                | "igsh"
+                | "si"
+                | "feature"
+                | "ref"
+                | "ref_src"
+                | "ref_url"
+                | "s"
+                | "t"
+                | "pp"
+                | "ab_channel"
+                | "twclid"
+                | "mc_cid"
+                | "mc_eid"
+                | "is_from_webapp"
+                | "sender_device"
+                | "share_app_id"
+                | "share_item_id"
+                | "social_sharing"
+                | "_r"
+                | "_t"
+        )
+}
+
+/// Canonical form used only for cache keys: tracking params dropped, queries
+/// sorted, share hosts and short links folded onto one URL.
+fn normalized_url(raw: &str) -> String {
+    let cleaned = raw.replace('\\', "");
+    let trimmed = cleaned.trim();
+    let Ok(mut url) = Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+    url.set_fragment(None);
+
+    let original_host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let host = original_host
+        .strip_prefix("www.")
+        .unwrap_or(&original_host)
+        .to_string();
+    let canonical_host = match host.as_str() {
+        "youtu.be" => Some("youtube.com"),
+        value if value == "youtube.com" || value.ends_with(".youtube.com") => Some("youtube.com"),
+        value if value == "twitter.com" || value.ends_with(".twitter.com") => Some("x.com"),
+        value if value == "x.com" || value.ends_with(".x.com") => Some("x.com"),
+        value if value == "instagram.com" || value.ends_with(".instagram.com") => {
+            Some("instagram.com")
+        }
+        value if value == "tiktok.com" || value.ends_with(".tiktok.com") => Some("tiktok.com"),
+        _ => None,
+    };
+    if let Some(host) = canonical_host {
+        let _ = url.set_host(Some(host));
+        if url.scheme() == "http" {
+            let _ = url.set_scheme("https");
+        }
+    }
+
+    let mut path = percent_encoding::percent_decode_str(url.path())
+        .decode_utf8_lossy()
+        .into_owned();
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+
+    let youtube_id = if original_host == "youtu.be" || original_host.ends_with(".youtu.be") {
+        path.trim_start_matches('/')
+            .split('/')
+            .next()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    } else if canonical_host == Some("youtube.com") {
+        let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        if segments.len() >= 2 && matches!(segments[0], "shorts" | "embed" | "live") {
+            Some(segments[1].to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(id) = youtube_id {
+        path = "/watch".to_string();
+        pairs.retain(|(key, _)| key != "v");
+        pairs.push(("v".to_string(), id));
+    }
+
+    url.set_path(&path);
+    pairs.retain(|(key, _)| !is_tracking_param(key));
+    pairs.sort();
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in &pairs {
+        serializer.append_pair(key, value);
+    }
+    let query = serializer.finish();
+    url.set_query((!query.is_empty()).then_some(query.as_str()));
+    url.to_string()
+}
+
+fn hash_component(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn cache_key(platform: Platform, url: &str, format: &str, cookies: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, b"ixian-cache-v1");
+    hash_component(&mut hasher, platform.name().as_bytes());
+    hash_component(&mut hasher, normalized_url(url).as_bytes());
+    hash_component(&mut hasher, format.as_bytes());
+    // `mode` is part of the key so future response modes cannot collide.
+    hash_component(&mut hasher, b"download");
+    hash_component(&mut hasher, cookie_fingerprint(cookies).as_bytes());
+    hex_digest(&hasher.finalize())
+}
+
+fn parse_bool(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.is_empty() || matches!(value.as_str(), "1" | "true" | "yes" | "on")
+}
+
+fn parse_bool_value(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => parse_bool(value),
+        Some(Value::Number(value)) => value.as_u64() == Some(1),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheMeta {
+    key: String,
+    file: String,
+    name: String,
+    size: u64,
+    content_type: String,
+    platform: String,
+    created: u64,
+    last_used: u64,
+}
+
+struct CacheEntry {
+    path: PathBuf,
+    meta: CacheMeta,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheStats {
+    enabled: bool,
+    entries: usize,
+    bytes: u64,
+    max_bytes: Option<u64>,
+    ttl_seconds: Option<u64>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+struct Cache {
+    dir: PathBuf,
+    ttl: Option<Duration>,
+    max_bytes: Option<u64>,
+    locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    store: AsyncMutex<()>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl Cache {
+    fn new(dir: PathBuf, ttl: Option<Duration>, max_bytes: Option<u64>) -> Self {
+        Self {
+            dir,
+            ttl,
+            max_bytes,
+            locks: StdMutex::new(HashMap::new()),
+            store: AsyncMutex::new(()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    fn objects_dir(&self) -> PathBuf {
+        self.dir.join("objects")
+    }
+
+    fn key_lock(&self, key: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        if locks.len() > 1024 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(key.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn has_live_lock(&self, key: &str) -> bool {
+        self.locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .and_then(Weak::upgrade)
+            .is_some()
+    }
+
+    async fn ensure_dirs(&self) -> io::Result<()> {
+        fs::create_dir_all(self.objects_dir()).await?;
+        fs::create_dir_all(self.dir.join("staging")).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700)).await;
+        }
+        Ok(())
+    }
+
+    fn expired(&self, meta: &CacheMeta) -> bool {
+        self.ttl
+            .is_some_and(|ttl| now_secs().saturating_sub(meta.created) > ttl.as_secs())
+    }
+
+    async fn write_meta(dir: &Path, meta: &CacheMeta) -> io::Result<()> {
+        let bytes = serde_json::to_vec(meta).map_err(io::Error::other)?;
+        let staging = dir.join("meta.json.tmp");
+        fs::write(&staging, bytes).await?;
+        fs::rename(staging, dir.join("meta.json")).await
+    }
+
+    async fn lookup(&self, key: &str) -> Option<CacheEntry> {
+        let _store = self.store.lock().await;
+        let dir = self.objects_dir().join(key);
+        let bytes = fs::read(dir.join("meta.json")).await.ok()?;
+        let Ok(mut meta) = serde_json::from_slice::<CacheMeta>(&bytes) else {
+            let _ = fs::remove_dir_all(&dir).await;
+            return None;
+        };
+        if meta.key != key || !safe_cache_file_name(&meta.file) {
+            let _ = fs::remove_dir_all(&dir).await;
+            return None;
+        }
+        if self.expired(&meta) {
+            let _ = fs::remove_dir_all(&dir).await;
+            return None;
+        }
+        let path = dir.join(&meta.file);
+        let Ok(file_meta) = fs::symlink_metadata(&path).await else {
+            let _ = fs::remove_dir_all(&dir).await;
+            return None;
+        };
+        if !file_meta.file_type().is_file() || file_meta.len() != meta.size {
+            let _ = fs::remove_dir_all(&dir).await;
+            return None;
+        }
+        meta.last_used = now_secs();
+        let _ = Self::write_meta(&dir, &meta).await;
+        Some(CacheEntry { path, meta })
+    }
+
+    async fn insert(
+        &self,
+        key: &str,
+        media: &DownloadedMedia,
+        platform: Platform,
+    ) -> Option<CacheEntry> {
+        if self
+            .max_bytes
+            .is_some_and(|max_bytes| media.size > max_bytes)
+        {
+            return None;
+        }
+        self.ensure_dirs().await.ok()?;
+
+        let extension = media
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .filter(|extension| {
+                !extension.is_empty()
+                    && extension.len() <= 16
+                    && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+            })
+            .unwrap_or("bin");
+        let file = format!("data.{extension}");
+        let now = now_secs();
+        let meta = CacheMeta {
+            key: key.to_string(),
+            file: file.clone(),
+            name: media.name.clone(),
+            size: media.size,
+            content_type: media.mime.clone(),
+            platform: platform.name().to_string(),
+            created: now,
+            last_used: now,
+        };
+
+        let staging = self
+            .dir
+            .join("staging")
+            .join(format!("ixian-{}", Uuid::new_v4()));
+        fs::create_dir_all(&staging).await.ok()?;
+        let staged = staging.join(&file);
+        if fs::hard_link(&media.path, &staged).await.is_err()
+            && fs::copy(&media.path, &staged).await.is_err()
+        {
+            let _ = fs::remove_dir_all(&staging).await;
+            return None;
+        }
+        let Ok(meta_bytes) = serde_json::to_vec(&meta) else {
+            let _ = fs::remove_dir_all(&staging).await;
+            return None;
+        };
+        if fs::write(staging.join("meta.json"), meta_bytes)
+            .await
+            .is_err()
+        {
+            let _ = fs::remove_dir_all(&staging).await;
+            return None;
+        }
+
+        let _store = self.store.lock().await;
+        let objects = self.objects_dir();
+        if fs::create_dir_all(&objects).await.is_err() {
+            let _ = fs::remove_dir_all(&staging).await;
+            return None;
+        }
+        let target = objects.join(key);
+        if fs::symlink_metadata(&target).await.is_ok() {
+            let _ = fs::remove_dir_all(&target).await;
+        }
+        if fs::rename(&staging, &target).await.is_err() {
+            let _ = fs::remove_dir_all(&staging).await;
+            return None;
+        }
+        self.enforce_limit_locked(key).await;
+        Some(CacheEntry {
+            path: target.join(file),
+            meta,
+        })
+    }
+
+    async fn entries_locked(&self) -> Vec<CacheMeta> {
+        let mut entries = Vec::new();
+        let Ok(mut read) = fs::read_dir(self.objects_dir()).await else {
+            return entries;
+        };
+        while let Ok(Some(entry)) = read.next_entry().await {
+            if !entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(entry.path().join("meta.json")).await else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<CacheMeta>(&bytes) else {
+                continue;
+            };
+            if entry.file_name().to_string_lossy() == meta.key {
+                entries.push(meta);
+            }
+        }
+        entries
+    }
+
+    async fn enforce_limit_locked(&self, keep: &str) {
+        let Some(max_bytes) = self.max_bytes else {
+            return;
+        };
+        let mut entries = self.entries_locked().await;
+        let mut total: u64 = entries.iter().map(|meta| meta.size).sum();
+        if total <= max_bytes {
+            return;
+        }
+        entries.sort_by_key(|meta| meta.last_used);
+        for meta in entries {
+            if total <= max_bytes {
+                break;
+            }
+            if meta.key == keep || self.has_live_lock(&meta.key) {
+                continue;
+            }
+            let dir = self.objects_dir().join(&meta.key);
+            if fs::remove_dir_all(&dir).await.is_ok() {
+                total = total.saturating_sub(meta.size);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn stats(&self) -> CacheStats {
+        let _store = self.store.lock().await;
+        let entries = self.entries_locked().await;
+        CacheStats {
+            enabled: true,
+            entries: entries.len(),
+            bytes: entries.iter().map(|meta| meta.size).sum(),
+            max_bytes: self.max_bytes,
+            ttl_seconds: self.ttl.map(|ttl| ttl.as_secs()),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    async fn clear(&self) -> (usize, u64) {
+        let _store = self.store.lock().await;
+        let Ok(mut read) = fs::read_dir(self.objects_dir()).await else {
+            return (0, 0);
+        };
+        let mut cleared = 0;
+        let mut bytes = 0;
+        while let Ok(Some(entry)) = read.next_entry().await {
+            if !entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let size = fs::read(entry.path().join("meta.json"))
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CacheMeta>(&bytes).ok())
+                .map(|meta| meta.size)
+                .unwrap_or(0);
+            if fs::remove_dir_all(entry.path()).await.is_ok() {
+                cleared += 1;
+                bytes += size;
+            }
+        }
+        (cleared, bytes)
+    }
+}
+
+fn safe_cache_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "meta.json"
+        && !name.contains('/')
+        && !name.contains('\\')
+        && Path::new(name).file_name().and_then(|value| value.to_str()) == Some(name)
 }
 
 #[derive(Debug)]
@@ -472,7 +1002,13 @@ fn authorize(config: &Config, headers: &HeaderMap) -> Result<(), ApiError> {
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| strip_prefix_ignore_case(value.trim(), "bearer "))
-        .map(str::trim);
+        .map(str::trim)
+        .or_else(|| {
+            headers
+                .get("x-ixian-token")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+        });
     let authorized =
         provided.is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()));
     if authorized {
@@ -578,6 +1114,19 @@ struct DownloadRequest {
     cookies: Option<String>,
     format: Option<String>,
     timeout: Option<Duration>,
+    inline: bool,
+}
+
+/// A completed yt-dlp download, still inside its per-download temp directory.
+struct DownloadedMedia {
+    path: PathBuf,
+    name: String,
+    mime: String,
+    size: u64,
+    platform: Platform,
+    hint: Option<&'static str>,
+    cleanup: Cleanup,
+    permit: OwnedSemaphorePermit,
 }
 
 /// Creates the per-download directory with `0700` from the first syscall.
@@ -714,15 +1263,13 @@ impl AsyncRead for TempFileReader {
     }
 }
 
-async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
-    let DownloadRequest {
-        url,
-        platform,
-        cookies,
-        format,
-        timeout: request_timeout,
-    } = request;
-    let cookies = cookies.filter(|cookies| !cookies.trim().is_empty());
+async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedMedia, ApiError> {
+    let platform = request.platform;
+    let url = request.url.replace('\\', "");
+    let cookies = request
+        .cookies
+        .clone()
+        .filter(|cookies| !cookies.trim().is_empty());
     if cookies
         .as_deref()
         .is_some_and(|cookies| cookies.len() > MAX_COOKIE_BYTES)
@@ -780,7 +1327,7 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         .arg("--max-filesize")
         .arg(config.max_filesize.to_string())
         .arg("-f")
-        .arg(format.as_deref().unwrap_or(&config.format))
+        .arg(request.format.as_deref().unwrap_or(&config.format))
         .arg("-o")
         .arg(dir.join("%(title)s [%(id)s].%(ext)s"));
     if let Some(plugin_dir) = &config.plugin_dir {
@@ -824,7 +1371,7 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         })
     });
 
-    let limit = request_timeout.unwrap_or(config.timeout);
+    let limit = request.timeout.unwrap_or(config.timeout);
     let status = match timeout(limit, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
@@ -895,9 +1442,6 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         ));
     }
 
-    let file = fs::File::open(&media).await.map_err(|error| {
-        ApiError::bad_gateway(format!("cannot read output file: {error}"), hint)
-    })?;
     let name = media
         .file_name()
         .and_then(|name| name.to_str())
@@ -905,28 +1449,85 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         .to_string();
     let mime = mime_guess::from_path(&media).first_or_octet_stream();
 
+    Ok(DownloadedMedia {
+        path: media,
+        name,
+        mime: mime.as_ref().to_string(),
+        size: metadata.len(),
+        platform,
+        hint,
+        cleanup,
+        permit,
+    })
+}
+
+async fn download(
+    config: &Config,
+    mut request: DownloadRequest,
+    method: Method,
+    headers: HeaderMap,
+) -> ApiResult {
+    request.url = request.url.replace('\\', "");
+    let Some(cache) = &config.cache else {
+        let media = fetch(config, &request).await?;
+        return stream_media(media, request.inline).await;
+    };
+
+    // Stored cookies change the response, so they are part of the cache key too.
+    let effective_cookies = match request.cookies.as_deref().map(str::trim) {
+        Some(cookies) if !cookies.is_empty() => request.cookies.clone(),
+        _ => stored_cookies(config, request.platform).await?,
+    };
+    let format = request.format.as_deref().unwrap_or(&config.format);
+    let key = cache_key(
+        request.platform,
+        &request.url,
+        format,
+        effective_cookies.as_deref(),
+    );
+    let key_lock = cache.key_lock(&key);
+    let _guard = key_lock.lock().await;
+
+    if let Some(entry) = cache.lookup(&key).await {
+        cache.hits.fetch_add(1, Ordering::Relaxed);
+        return Ok(serve_entry(entry, &request, method, headers).await);
+    }
+    cache.misses.fetch_add(1, Ordering::Relaxed);
+
+    let media = fetch(config, &request).await?;
+    let Some(entry) = cache.insert(&key, &media, request.platform).await else {
+        return stream_media(media, request.inline).await;
+    };
+    drop(media);
+    Ok(serve_entry(entry, &request, method, headers).await)
+}
+
+async fn stream_media(media: DownloadedMedia, inline: bool) -> ApiResult {
+    let DownloadedMedia {
+        path,
+        name,
+        mime,
+        size,
+        platform,
+        hint,
+        cleanup,
+        permit,
+    } = media;
+    let file = fs::File::open(&path).await.map_err(|error| {
+        ApiError::bad_gateway(format!("cannot read output file: {error}"), hint)
+    })?;
+
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(mime.as_ref())
+        HeaderValue::from_str(&mime)
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
     headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&metadata.len().to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+        HeaderValue::from_str(&size.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
-    let disposition = format!(
-        "attachment; filename*=UTF-8''{}",
-        percent_encoding::utf8_percent_encode(&name, FILENAME_ENCODE)
-    );
-    if let Ok(value) = HeaderValue::from_str(&disposition) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-    headers.insert(
-        "x-ixian-platform",
-        HeaderValue::from_static(platform.name()),
-    );
+    add_media_headers(&mut headers, &name, platform.name(), inline);
 
     let reader = TempFileReader {
         file,
@@ -939,6 +1540,63 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
     Ok(response)
 }
 
+async fn serve_entry(
+    entry: CacheEntry,
+    request: &DownloadRequest,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let CacheEntry { path, meta } = entry;
+    let inline = request.inline;
+    let method = if method == Method::GET || method == Method::HEAD {
+        method
+    } else {
+        Method::GET
+    };
+    let mut builder = Request::builder().method(method).uri("/");
+    for name in [
+        header::RANGE.as_str(),
+        header::IF_NONE_MATCH.as_str(),
+        header::IF_MODIFIED_SINCE.as_str(),
+        header::IF_MATCH.as_str(),
+        header::IF_UNMODIFIED_SINCE.as_str(),
+    ] {
+        if let Some(value) = headers.get(name) {
+            builder = builder.header(name, value);
+        }
+    }
+    let request = match builder.body(Body::empty()) {
+        Ok(request) => request,
+        Err(error) => return ApiError::internal(error.to_string()).into_response(),
+    };
+    let mut response = match ServeFile::new(&path).oneshot(request).await {
+        Ok(response) => response.map(Body::new),
+        Err(never) => match never {},
+    };
+    add_media_headers(response.headers_mut(), &meta.name, &meta.platform, inline);
+    if response.status() != StatusCode::NOT_MODIFIED {
+        if let Ok(value) = HeaderValue::from_str(&meta.content_type) {
+            response.headers_mut().insert(header::CONTENT_TYPE, value);
+        }
+    }
+    response
+}
+
+fn add_media_headers(headers: &mut HeaderMap, name: &str, platform: &str, inline: bool) {
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+    let kind = if inline { "inline" } else { "attachment" };
+    let disposition = format!(
+        "{kind}; filename*=UTF-8''{}",
+        percent_encoding::utf8_percent_encode(name, FILENAME_ENCODE)
+    );
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(platform) {
+        headers.insert("x-ixian-platform", value);
+    }
+}
+
 async fn root() -> Json<Value> {
     Json(json!({
         "message": "Hello!",
@@ -946,7 +1604,12 @@ async fn root() -> Json<Value> {
     }))
 }
 
-async fn download_get(State(config): State<Arc<Config>>, uri: Uri) -> ApiResult {
+async fn download_get(
+    State(config): State<Arc<Config>>,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+) -> ApiResult {
     let params: HashMap<String, String> =
         url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .into_owned()
@@ -980,12 +1643,20 @@ async fn download_get(State(config): State<Arc<Config>>, uri: Uri) -> ApiResult 
                 .filter(|format| !format.is_empty())
                 .cloned(),
             timeout,
+            inline: params.get("inline").is_some_and(|value| parse_bool(value)),
         },
+        method,
+        headers,
     )
     .await
 }
 
-async fn download_post(State(config): State<Arc<Config>>, body: String) -> ApiResult {
+async fn download_post(
+    State(config): State<Arc<Config>>,
+    method: Method,
+    headers: HeaderMap,
+    body: String,
+) -> ApiResult {
     let parsed: Value = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(_) => serde_json::from_str(&sanitize_json_escapes(&body)).map_err(|_| {
@@ -1028,9 +1699,42 @@ async fn download_post(State(config): State<Arc<Config>>, body: String) -> ApiRe
                 .filter(|format| !format.is_empty())
                 .map(str::to_string),
             timeout,
+            inline: parse_bool_value(object.get("inline")),
         },
+        method,
+        headers,
     )
     .await
+}
+
+async fn cache_stats(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize(&config, &headers)?;
+    match &config.cache {
+        Some(cache) => Ok(Json(cache.stats().await).into_response()),
+        None => Ok(Json(json!({ "enabled": false })).into_response()),
+    }
+}
+
+async fn cache_clear(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize(&config, &headers)?;
+    match &config.cache {
+        Some(cache) => {
+            let (cleared, bytes) = cache.clear().await;
+            Ok(Json(json!({
+                "enabled": true,
+                "cleared": cleared,
+                "bytes": bytes,
+            }))
+            .into_response())
+        }
+        None => Ok(Json(json!({ "enabled": false, "cleared": 0 })).into_response()),
+    }
 }
 
 fn cookie_store_dir(config: &Config) -> Result<&Path, ApiError> {
@@ -1135,6 +1839,8 @@ fn app(config: Arc<Config>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/download", get(download_get).post(download_post))
+        .route("/cache/stats", get(cache_stats))
+        .route("/cache", delete(cache_clear))
         .route("/cookies", get(list_cookies))
         .route("/cookies/{platform}", put(put_cookie).delete(delete_cookie))
         .method_not_allowed_fallback(method_not_allowed)
@@ -1399,6 +2105,74 @@ mod tests {
             "video/webm"
         );
     }
+    #[test]
+    fn normalizes_urls_for_cache_keys() {
+        assert_eq!(
+            normalized_url("https://youtu.be/abc?si=share"),
+            "https://youtube.com/watch?v=abc"
+        );
+        assert_eq!(
+            normalized_url("https://www.youtube.com/shorts/abc/?utm_source=x"),
+            "https://youtube.com/watch?v=abc"
+        );
+        assert_eq!(
+            normalized_url("https://twitter.com/user/status/1?s=20"),
+            "https://x.com/user/status/1"
+        );
+        assert_eq!(
+            normalized_url("https://www.instagram.com/reel/abc/?igsh=x"),
+            "https://instagram.com/reel/abc"
+        );
+        assert_eq!(
+            normalized_url("https://example.com/v?b=2&a=1"),
+            "https://example.com/v?a=1&b=2"
+        );
+        assert_eq!(
+            normalized_url("https://vm.tiktok.com/ZMabc/?is_from_webapp=1&sender_device=pc"),
+            "https://tiktok.com/ZMabc"
+        );
+    }
+
+    #[test]
+    fn cache_keys_cover_cookies_and_format() {
+        let base = cache_key(
+            Platform::YouTube,
+            "https://youtu.be/abc",
+            DEFAULT_FORMAT,
+            None,
+        );
+        assert_eq!(
+            base,
+            cache_key(
+                Platform::YouTube,
+                "https://www.youtube.com/watch?v=abc&utm_source=share",
+                DEFAULT_FORMAT,
+                Some("")
+            )
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                Platform::YouTube,
+                "https://youtu.be/abc",
+                DEFAULT_FORMAT,
+                Some("auth_token=secret")
+            )
+        );
+        assert_ne!(
+            base,
+            cache_key(Platform::YouTube, "https://youtu.be/abc", "bv*+ba/b", None)
+        );
+    }
+
+    #[test]
+    fn parses_inline_flags() {
+        assert!(parse_bool("1"));
+        assert!(parse_bool("true"));
+        assert!(parse_bool("yes"));
+        assert!(!parse_bool("0"));
+        assert!(!parse_bool("false"));
+    }
 }
 
 #[cfg(test)]
@@ -1439,6 +2213,7 @@ for arg in "$@"; do
   prev="$arg"
 done
 printf '%s\n' "$@" > "$LOG/args.txt"
+printf 'run\n' >> "$LOG/runs.txt"
 if [ -n "$jar" ]; then cp -p "$jar" "$LOG/jar.txt"; fi
 {extra}
 prefix="${{out%%\%*}}"
@@ -1457,7 +2232,15 @@ printf '%s\n' "${{prefix}}fake.mp4"
         }
 
         fn config(&self, timeout: Duration) -> Arc<Config> {
-            self.config_full(timeout, None, None, None, MAX_CONCURRENT, MAX_FILESIZE)
+            self.config_full(
+                timeout,
+                None,
+                None,
+                None,
+                None,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
         }
 
         fn config_with_plugin_dir(
@@ -1468,6 +2251,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             self.config_full(
                 timeout,
                 plugin_dir,
+                None,
                 None,
                 None,
                 MAX_CONCURRENT,
@@ -1485,6 +2269,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
                 timeout,
                 None,
                 Some(cookie_dir),
+                None,
                 token.map(str::to_string),
                 MAX_CONCURRENT,
                 MAX_FILESIZE,
@@ -1498,14 +2283,54 @@ printf '%s\n' "${{prefix}}fake.mp4"
             concurrency: usize,
             max_filesize: u64,
         ) -> Arc<Config> {
-            self.config_full(timeout, plugin_dir, None, None, concurrency, max_filesize)
+            self.config_full(
+                timeout,
+                plugin_dir,
+                None,
+                None,
+                None,
+                concurrency,
+                max_filesize,
+            )
         }
 
+        fn config_with_cache(&self, cache: Cache) -> Arc<Config> {
+            self.config_full(
+                Duration::from_secs(30),
+                None,
+                None,
+                Some(cache),
+                None,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
+        }
+
+        fn config_with(
+            &self,
+            timeout: Duration,
+            plugin_dir: Option<PathBuf>,
+            cache: Option<Cache>,
+            token: Option<String>,
+        ) -> Arc<Config> {
+            self.config_full(
+                timeout,
+                plugin_dir,
+                None,
+                cache,
+                token,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
         fn config_full(
             &self,
             timeout: Duration,
             plugin_dir: Option<PathBuf>,
             cookie_dir: Option<PathBuf>,
+            cache: Option<Cache>,
             token: Option<String>,
             concurrency: usize,
             max_filesize: u64,
@@ -1518,11 +2343,18 @@ printf '%s\n' "${{prefix}}fake.mp4"
                 format: DEFAULT_FORMAT.into(),
                 timeout,
                 tmp: self.tmp.path().to_path_buf(),
+                cache,
                 cookie_dir,
                 token,
                 downloads: Arc::new(Semaphore::new(concurrency)),
                 max_filesize,
             })
+        }
+
+        fn runs(&self) -> usize {
+            stdfs::read_to_string(self.logs.path().join("runs.txt"))
+                .map(|runs| runs.lines().count())
+                .unwrap_or(0)
         }
     }
 
@@ -2276,5 +3108,282 @@ printf '%s\n' "${{prefix}}fake.mp4"
             .parse()
             .unwrap();
         assert_process_dies(pid).await;
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn disk_cache(dir: &TempDir, ttl: Option<Duration>, max_bytes: Option<u64>) -> Cache {
+        Cache::new(dir.path().to_path_buf(), ttl, max_bytes)
+    }
+
+    #[tokio::test]
+    async fn caches_downloads_and_normalizes_urls() {
+        let harness = Harness::new("");
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(
+            &cache_dir,
+            Some(Duration::from_secs(3600)),
+            Some(1024 * 1024),
+        );
+        let app = app(harness.config_with_cache(cache));
+
+        let first = serde_json::json!({
+            "url": "https://www.youtube.com/watch?v=abc&utm_source=share",
+        })
+        .to_string();
+        let (status, headers, body) =
+            request(app.clone(), Method::POST, "/download", Some(first)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"fake video data");
+        assert_eq!(headers[header::CACHE_CONTROL], "private");
+        assert!(headers[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;"));
+
+        let second = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let (status, _, body) = request(app.clone(), Method::POST, "/download", Some(second)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"fake video data");
+        assert_eq!(harness.runs(), 1, "second request should be a cache hit");
+
+        let (status, headers, body) = request(
+            app.clone(),
+            Method::GET,
+            "/download?url=https://youtu.be/abc&inline=1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"fake video data");
+        assert_eq!(headers[header::CACHE_CONTROL], "private");
+        assert!(headers[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("inline;"));
+        assert_eq!(harness.runs(), 1);
+
+        let (status, _, body) = request(app, Method::GET, "/cache/stats", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let stats: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stats["entries"], 1);
+        assert_eq!(stats["misses"], 1);
+        assert_eq!(stats["hits"], 2);
+    }
+
+    #[tokio::test]
+    async fn serves_range_head_and_conditional_requests_from_cache() {
+        let harness = Harness::new("");
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(&cache_dir, None, Some(1024 * 1024));
+        let app = app(harness.config_with_cache(cache));
+        let uri = "/download?url=https://youtu.be/range";
+
+        let (status, headers, body) = request_with_headers(
+            app.clone(),
+            Method::GET,
+            uri,
+            None,
+            header_map(&[(header::RANGE.as_str(), "bytes=0-3")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, b"fake");
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 0-3/15");
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(harness.runs(), 1);
+
+        let (status, headers, body) = request_with_headers(
+            app.clone(),
+            Method::GET,
+            uri,
+            None,
+            header_map(&[(header::RANGE.as_str(), "bytes=5-9")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, b"video");
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 5-9/15");
+        assert_eq!(harness.runs(), 1);
+
+        let (status, headers, body) = request(app.clone(), Method::HEAD, uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        assert_eq!(headers[header::CONTENT_LENGTH], "15");
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(harness.runs(), 1);
+        let etag = headers[header::ETAG].to_str().unwrap().to_string();
+
+        let (status, _, body) = request_with_headers(
+            app,
+            Method::GET,
+            uri,
+            None,
+            header_map(&[(header::IF_NONE_MATCH.as_str(), etag.as_str())]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert!(body.is_empty());
+        assert_eq!(harness.runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupes_concurrent_same_key_downloads() {
+        let harness = Harness::new("sleep 0.4");
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(&cache_dir, None, Some(1024 * 1024));
+        let app = app(harness.config_with_cache(cache));
+        let payload = serde_json::json!({ "url": "https://youtu.be/concurrent" }).to_string();
+
+        let (first, second) = tokio::join!(
+            request(
+                app.clone(),
+                Method::POST,
+                "/download",
+                Some(payload.clone())
+            ),
+            request(app, Method::POST, "/download", Some(payload))
+        );
+
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(second.0, StatusCode::OK);
+        assert_eq!(first.2, b"fake video data");
+        assert_eq!(second.2, b"fake video data");
+        assert_eq!(
+            harness.runs(),
+            1,
+            "same-key requests must share one yt-dlp run"
+        );
+    }
+
+    #[tokio::test]
+    async fn evicts_least_recently_used_entries() {
+        let harness = Harness::new("");
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(&cache_dir, None, Some(20));
+        let app = app(harness.config_with_cache(cache));
+
+        for url in ["https://youtu.be/first", "https://youtu.be/second"] {
+            let payload = serde_json::json!({ "url": url }).to_string();
+            let (status, _, body) =
+                request(app.clone(), Method::POST, "/download", Some(payload)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, b"fake video data");
+        }
+
+        assert_eq!(harness.runs(), 2);
+        let (status, _, body) = request(app, Method::GET, "/cache/stats", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let stats: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stats["entries"], 1);
+        assert_eq!(stats["bytes"], 15);
+        assert_eq!(stats["evictions"], 1);
+        assert_eq!(
+            stdfs::read_dir(cache_dir.path().join("objects"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn protects_cache_admin_routes_and_clears_entries() {
+        let harness = Harness::new("");
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(&cache_dir, None, Some(1024 * 1024));
+        let app = app(harness.config_with(
+            Duration::from_secs(30),
+            None,
+            Some(cache),
+            Some("secret".into()),
+        ));
+
+        let payload = serde_json::json!({ "url": "https://youtu.be/protected" }).to_string();
+        let (status, _, _) = request(app.clone(), Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = request(app.clone(), Method::GET, "/cache/stats", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let auth = header_map(&[(header::AUTHORIZATION.as_str(), "Bearer secret")]);
+        let (status, _, body) =
+            request_with_headers(app.clone(), Method::GET, "/cache/stats", None, auth.clone())
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        let stats: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stats["entries"], 1);
+
+        let (status, _, _) = request(app.clone(), Method::DELETE, "/cache", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, body) =
+            request_with_headers(app.clone(), Method::DELETE, "/cache", None, auth.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let cleared: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cleared["cleared"], 1);
+
+        let (status, _, body) =
+            request_with_headers(app, Method::GET, "/cache/stats", None, auth).await;
+        assert_eq!(status, StatusCode::OK);
+        let stats: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stats["entries"], 0);
+        assert_eq!(harness.runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn stored_cookies_partition_the_cache() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        stdfs::create_dir(&dir).unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(&cache_dir, None, Some(1024 * 1024));
+        let app = app(harness.config_full(
+            Duration::from_secs(30),
+            None,
+            Some(dir.clone()),
+            Some(cache),
+            None,
+            MAX_CONCURRENT,
+            MAX_FILESIZE,
+        ));
+
+        stdfs::write(
+            dir.join("youtube.txt"),
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tone\n",
+        )
+        .unwrap();
+        let payload = serde_json::json!({ "url": "https://youtu.be/stored" }).to_string();
+        let (status, _, _) = request(
+            app.clone(),
+            Method::POST,
+            "/download",
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(harness.runs(), 1);
+
+        stdfs::write(
+            dir.join("youtube.txt"),
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\ttwo\n",
+        )
+        .unwrap();
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            harness.runs(),
+            2,
+            "changed stored cookies must not reuse the cache entry"
+        );
     }
 }

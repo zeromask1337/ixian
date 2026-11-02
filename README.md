@@ -70,6 +70,7 @@ For a bind mount, make it writable by the container user (uid/gid `1000`):
 | `platform` | optional override: `youtube`, `x`, `instagram`, `tiktok` (otherwise detected from the URL). The URL must still belong to that platform |
 | `format` | optional yt-dlp format selector (default: best mp4) |
 | `timeout_ms` | optional download timeout in milliseconds (default `600000`, or `YTDLP_TIMEOUT_MS`); `timeoutMs` is accepted as an alias |
+| `inline` | `1` serves `content-disposition: inline` for browser playback (default: attachment) |
 
 Cookies are **not** accepted on `GET`: they would leak into access logs and browser
 history. A `*_cookies` parameter returns `400` with a hint to use `POST /download`.
@@ -146,10 +147,32 @@ curl -X DELETE http://127.0.0.1:3000/cookies/youtube
 - Rotate by repeating `PUT`; the replacement is atomic. Re-export after a login/password change or extractor `401`/login failures, and before cookies expire. Expired cookies are worse than none for some platforms.
 - Docker: the image sets `IXIAN_COOKIE_DIR=/data/cookies`; see [Docker](#docker) for the volume mount. For a bind mount, make the host directory writable by uid `1000` (the `node` user).
 
+### Cache
+
+Downloads are cached on disk. The key is
+`SHA-256(platform + normalized URL + format + cookie fingerprint)`, so tracking
+params, `youtu.be`/`twitter.com` aliases and query order do not cause duplicate
+downloads. Requests that send cookies are cached under a hash of the cookies,
+never the cookie contents; cookies auto-loaded from the [cookie store](#cookie-store)
+are part of the key too.
+
+Cache hits are served through `tower-http`'s `ServeFile`, so `Range`,
+`If-None-Match`, `ETag` and `HEAD` work on both cache hits and misses. Concurrent
+requests for the same key share one yt-dlp process. Entries are evicted least
+recently used once `CACHE_MAX_BYTES` is exceeded.
+
+```sh
+curl 'http://127.0.0.1:3000/cache/stats'
+curl -X DELETE 'http://127.0.0.1:3000/cache'
+```
+
+`GET /cache/stats` and `DELETE /cache` are open by default. Set `IXIAN_TOKEN` to
+require `Authorization: Bearer <token>` (or `x-ixian-token: <token>`).
+
 ### Response
 
-- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform` header). Temp files are cleaned up after streaming.
-- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request, including cookies on `GET` and URLs outside the platform allowlist), `401` (cookie write without a valid `IXIAN_TOKEN`), `404`, `405`, `413` (cookie too large), `429` (too many concurrent downloads), `502` (yt-dlp failed/timeout), `500`.
+- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform`, `Cache-Control: private`, `ETag`, `Accept-Ranges: bytes`); cache hits also answer `Range`, `HEAD` and `If-None-Match` (`304`). `inline=1` (or `"inline": true` in JSON) switches to `content-disposition: inline` for browser playback. Temp files are cleaned up after streaming.
+- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request, including cookies on `GET` and URLs outside the platform allowlist), `401` (cookie write or cache admin without a valid `IXIAN_TOKEN`), `404`, `405`, `413` (cookie too large), `429` (too many concurrent downloads), `502` (yt-dlp failed/timeout), `500`.
 
 ### Limits
 
@@ -216,14 +239,17 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
 | `IXIAN_COOKIE_DIR` | unset | cookie store directory (Docker: `/data/cookies`); auto-loads `<platform>.txt` and enables cookie writes |
-| `IXIAN_TOKEN` | unset | require `Authorization: Bearer <token>` on cookie writes; unset leaves them open |
+| `IXIAN_CACHE_DIR` | `<tmp>/ixian-cache` | disk cache directory (`off` disables caching) |
+| `CACHE_TTL` | `604800` | entry lifetime in seconds (`0` never expires) |
+| `CACHE_MAX_BYTES` | `10737418240` | LRU byte budget (`0` unlimited) |
+| `IXIAN_TOKEN` | unset | require `Authorization: Bearer <token>` on cookie writes and cache admin routes; unset leaves them open |
 
 ## Notes
 
 - The whole server is one file (`src/main.rs`) built on `axum`, `tokio::process` and `tokio::fs`; the only external runtime dependencies are `yt-dlp` and `ffmpeg`.
 - The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself.
 - Playlists are disabled (`--no-playlist` plus `--playlist-items 1`): one URL yields one file. For an X post that quotes another post (or carries several videos), the linked post's first video is returned, not the quoted/original one.
-- Downloads are saved to a unique temp file and streamed back, then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
+- Downloads are staged in a unique temp directory. With caching enabled the media is hard-linked/copied into `IXIAN_CACHE_DIR` and served from there; without a cached copy the temp file is streamed and then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
 - Instagram: some networks drop TLS for `*.instagram.com` and geo-picked CDN edges. Two bundled yt-dlp plugins work around that:
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
   - `ixian_ig` rewrites media URLs to the shared `scontent.cdninstagram.com` endpoint (`IXIAN_IG_CDN_HOST`).
@@ -238,7 +264,7 @@ cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests exercise streaming, temp-file cleanup, cookie jar generation and permissions (temp dir `0700`, jar `0600`), cookie store auto-load/override/atomic write, URL/platform allowlist checks, GET cookie rejection, timeout aliases and caps, concurrency (`429`), stderr/output-size caps, `--` argument termination, process-group kills (timeout and cancellation), yt-dlp failures and bounded pipe drains without touching the network.
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation and permissions (temp dir `0700`, jar `0600`), cookie store auto-load/override/atomic write, URL/platform allowlist checks, GET cookie rejection, timeout aliases and caps, concurrency (`429`), stderr/output-size caps, `--` argument termination, process-group kills (timeout and cancellation), yt-dlp failures and bounded pipe drains without touching the network. Cache tests cover hit/miss, URL normalization, `Range`, `HEAD`, `304`, concurrent same-key dedupe, LRU eviction and admin auth.
 
 Smoke-tested end to end against public media (2026-10-27):
 
