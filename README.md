@@ -87,6 +87,34 @@ jq -n --rawfile c cookies.txt \
     -H 'content-type: application/json' --data-binary @- -o video.mp4
 ```
 
+### Async jobs
+
+Use jobs when a request may outlive a mobile connection. `POST /jobs` takes the same JSON body as `POST /download` and returns `202 Accepted` immediately:
+
+```sh
+id=$(curl -s -X POST http://127.0.0.1:3000/jobs \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}' |
+  jq -r .id)
+```
+
+| endpoint | description |
+| --- | --- |
+| `POST /jobs` | enqueue a download; returns `{id, status, position}` |
+| `GET /jobs/{id}` | returns `{id, status, progress, bytes, total_bytes, eta, position, error}` |
+| `GET /jobs/{id}/file` | streams the finished file; supports single `Range` and `HEAD` |
+| `DELETE /jobs/{id}` | cancels a queued or running job and kills its process group |
+
+Status moves `queued -> running -> done`, or ends as `failed` / `cancelled`. `progress` is a percentage (`0`-`100`), `bytes` is downloaded bytes, `eta` is best-effort seconds, and `position` is 1-based while queued (`0` otherwise). Failures carry `error: {error, code, hint}`.
+
+```sh
+curl -s http://127.0.0.1:3000/jobs/$id
+curl -L http://127.0.0.1:3000/jobs/$id/file -o video.mp4
+curl -X DELETE http://127.0.0.1:3000/jobs/$id
+```
+
+Jobs are held in memory (a restart loses history). At most `MAX_CONCURRENT` jobs download at once, with up to `MAX_QUEUE` more waiting; extra requests get `429`. Finished jobs and their files are deleted after `JOB_TTL_MS`.
+
 ### Cookie formats
 
 The cookie parameter accepts either:
@@ -146,6 +174,9 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 | `YTDLP_PLUGIN_DIR` | `<repo>/yt-dlp-plugins` | yt-dlp plugin directory (skipped when missing) |
 | `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | default format when `format` is not passed |
 | `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout |
+| `MAX_CONCURRENT` | `2` | maximum jobs downloading at once |
+| `MAX_QUEUE` | `32` | maximum jobs waiting for a download slot |
+| `JOB_TTL_MS` | `3600000` | how long finished jobs/files are kept |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
 
@@ -154,7 +185,7 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 - The whole server is one file (`src/main.rs`) built on `axum`, `tokio::process` and `tokio::fs`; the only external runtime dependencies are `yt-dlp` and `ffmpeg`.
 - The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself.
 - Playlists are disabled (`--no-playlist` plus `--playlist-items 1`): one URL yields one file. For an X post that quotes another post (or carries several videos), the linked post's first video is returned, not the quoted/original one.
-- Downloads are saved to a unique temp file and streamed back, then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
+- Synchronous downloads are saved to a unique temp file and streamed back, then deleted. Async jobs keep the finished file until it expires (`JOB_TTL_MS`). There is no server idle timeout, so large files can stream for as long as the client reads them.
 - Instagram: some networks drop TLS for `*.instagram.com` and geo-picked CDN edges. Two bundled yt-dlp plugins work around that:
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
   - `ixian_ig` rewrites media URLs to the shared `scontent.cdninstagram.com` endpoint (`IXIAN_IG_CDN_HOST`).
@@ -168,7 +199,7 @@ cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, request validation, yt-dlp failures and timeouts without touching the network.
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, request validation, yt-dlp failures and timeouts, plus job progress, queueing/cancellation, process-group cleanup, Range/HEAD and TTL expiry without touching the network.
 
 Smoke-tested end to end against public media (2026-10-27):
 
