@@ -1,10 +1,10 @@
-// ixian - minimal yt-dlp wrapper (youtube / x.com / instagram) in Rust.
+// ixian - minimal yt-dlp wrapper (youtube / x.com / instagram / tiktok) in Rust.
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as UrlPath, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    env, io,
+    env,
+    io::{self, Write},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -25,10 +26,10 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::TcpListener,
     process::Command,
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 use tokio_util::io::ReaderStream;
@@ -40,9 +41,29 @@ use uuid::Uuid;
 const DEFAULT_FORMAT: &str = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4]/bv*+ba/b";
 const COOKIE_HINT: &str =
     "cookies may be invalid or incomplete; public posts download without cookies";
+const COOKIE_DIR_MODE: u32 = 0o700;
+const COOKIE_FILE_MODE: u32 = 0o600;
+const MAX_STORED_COOKIE_BYTES: usize = 1024 * 1024;
+const GET_COOKIE_HINT: &str = "send cookies in a POST /download JSON body instead";
+const GET_COOKIE_PARAMS: [&str; 4] = [
+    "youtube_cookies",
+    "x_cookies",
+    "instagram_cookies",
+    "tiktok_cookies",
+];
 const STREAM_CHUNK: usize = 64 * 1024;
 const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_CONCURRENT: usize = 4;
+const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+const MAX_COOKIE_BYTES: usize = 256 * 1024;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+const MAX_FILESIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const SOCKET_TIMEOUT_SECS: u64 = 10;
+const RETRIES: u64 = 3;
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const FILENAME_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
@@ -59,16 +80,23 @@ enum Platform {
     YouTube,
     X,
     Instagram,
+    TikTok,
 }
 
 impl Platform {
-    const ALL: [Platform; 3] = [Platform::YouTube, Platform::X, Platform::Instagram];
+    const ALL: [Platform; 4] = [
+        Platform::YouTube,
+        Platform::X,
+        Platform::Instagram,
+        Platform::TikTok,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Platform::YouTube => "youtube",
             Platform::X => "x",
             Platform::Instagram => "instagram",
+            Platform::TikTok => "tiktok",
         }
     }
 
@@ -77,6 +105,7 @@ impl Platform {
             Platform::YouTube => &["youtube.com", "youtu.be"],
             Platform::X => &["x.com", "twitter.com"],
             Platform::Instagram => &["instagram.com"],
+            Platform::TikTok => &["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"],
         }
     }
 
@@ -85,12 +114,30 @@ impl Platform {
             Platform::YouTube => &[".youtube.com"],
             Platform::X => &[".x.com", ".twitter.com"],
             Platform::Instagram => &[".instagram.com"],
+            Platform::TikTok => &[".tiktok.com"],
         }
     }
 
     fn from_name(name: &str) -> Option<Platform> {
         Platform::ALL.into_iter().find(|p| p.name() == name)
     }
+}
+
+fn supported_names() -> String {
+    Platform::ALL
+        .iter()
+        .map(|platform| platform.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_platform(name: &str) -> Result<Platform, ApiError> {
+    Platform::from_name(name).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "unknown platform '{name}' (expected: {})",
+            supported_names()
+        ))
+    })
 }
 
 struct Config {
@@ -102,7 +149,10 @@ struct Config {
     timeout: Duration,
     tmp: PathBuf,
     cache: Option<Cache>,
+    cookie_dir: Option<PathBuf>,
     token: Option<String>,
+    downloads: Arc<Semaphore>,
+    max_filesize: u64,
 }
 
 impl Config {
@@ -122,11 +172,11 @@ impl Config {
         let timeout_ms = env::var("YTDLP_TIMEOUT_MS")
             .ok()
             .and_then(|v| parse_ms(&v))
-            .unwrap_or_else(|| Duration::from_millis(600_000));
+            .unwrap_or_else(|| Duration::from_millis(MAX_TIMEOUT_MS))
+            .min(Duration::from_millis(MAX_TIMEOUT_MS));
         let tmp = non_empty(env::var("TMPDIR").ok())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
-
         let cache_dir_env = env::var("IXIAN_CACHE_DIR").ok();
         let cache_enabled = cache_dir_env
             .as_deref()
@@ -153,7 +203,11 @@ impl Config {
             let max_bytes = (max_bytes > 0).then_some(max_bytes);
             Cache::new(dir, ttl, max_bytes)
         });
-        let token = non_empty(env::var("IXIAN_TOKEN").ok());
+        let cookie_dir = non_empty(env::var("IXIAN_COOKIE_DIR").ok()).map(PathBuf::from);
+        let token = env::var("IXIAN_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         Self {
             host,
@@ -164,7 +218,10 @@ impl Config {
             timeout: timeout_ms,
             tmp,
             cache,
+            cookie_dir,
             token,
+            downloads: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            max_filesize: MAX_FILESIZE,
         }
     }
 }
@@ -222,6 +279,13 @@ fn is_tracking_param(name: &str) -> bool {
                 | "twclid"
                 | "mc_cid"
                 | "mc_eid"
+                | "is_from_webapp"
+                | "sender_device"
+                | "share_app_id"
+                | "share_item_id"
+                | "social_sharing"
+                | "_r"
+                | "_t"
         )
 }
 
@@ -248,6 +312,7 @@ fn normalized_url(raw: &str) -> String {
         value if value == "instagram.com" || value.ends_with(".instagram.com") => {
             Some("instagram.com")
         }
+        value if value == "tiktok.com" || value.ends_with(".tiktok.com") => Some("tiktok.com"),
         _ => None,
     };
     if let Some(host) = canonical_host {
@@ -678,6 +743,22 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
+    fn bad_request_with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    fn too_large(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, message)
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, message)
+    }
+
     fn bad_gateway(message: impl Into<String>, hint: Option<&str>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -704,37 +785,58 @@ impl IntoResponse for ApiError {
 
 type ApiResult = Result<Response, ApiError>;
 
-fn resolve_platform(url: &str, requested: Option<&str>) -> Result<Platform, ApiError> {
-    if let Some(requested) = requested.filter(|name| !name.is_empty()) {
-        return Platform::from_name(requested).ok_or_else(|| {
+/// Parses and validates a request URL, returning the cleaned URL (stray
+/// backslashes removed) and the platform it belongs to. A `platform` override
+/// still has to match the URL host: it never widens the allowlist.
+fn validate_url(raw_url: &str, requested: Option<&str>) -> Result<(String, Platform), ApiError> {
+    let platform = match requested.filter(|name| !name.is_empty()) {
+        Some(requested) => parse_platform(requested)?,
+        None => detect_platform(raw_url).ok_or_else(|| {
             ApiError::bad_request(format!(
-                "unknown platform '{requested}' (expected: youtube, x, instagram)"
+                "cannot detect platform (supported: {}); pass 'platform' to override",
+                supported_names()
             ))
-        });
+        })?,
+    };
+
+    let cleaned = raw_url.replace('\\', "");
+    let url = Url::parse(&cleaned)
+        .map_err(|_| ApiError::bad_request("invalid url (expected an absolute http(s) URL)"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ApiError::bad_request("url must use http or https"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::bad_request("url has no host"))?;
+    if !host_allowed(platform, host) {
+        return Err(ApiError::bad_request(format!(
+            "url host '{host}' is not allowed for platform '{}'",
+            platform.name()
+        )));
     }
 
-    detect_platform(url).ok_or_else(|| {
-        ApiError::bad_request(
-            "cannot detect platform (supported: youtube, x, instagram); pass 'platform' to override",
-        )
-    })
+    Ok((cleaned, platform))
 }
 
 fn detect_platform(raw_url: &str) -> Option<Platform> {
-    let url = Url::parse(raw_url).ok()?;
+    let url = Url::parse(&raw_url.replace('\\', "")).ok()?;
     let host = url.host_str()?;
+    Platform::ALL
+        .into_iter()
+        .find(|platform| host_allowed(*platform, host))
+}
+
+fn host_allowed(platform: Platform, host: &str) -> bool {
     let host = host.strip_prefix("www.").unwrap_or(host);
-    Platform::ALL.into_iter().find(|platform| {
-        platform
-            .hosts()
-            .iter()
-            .any(|candidate| host == *candidate || host.ends_with(&format!(".{candidate}")))
-    })
+    platform
+        .hosts()
+        .iter()
+        .any(|candidate| host == *candidate || host.ends_with(&format!(".{candidate}")))
 }
 
 /// Netscape cookie file from either a Netscape file (passed through) or a raw `Cookie:` header string.
 fn cookie_file(cookies: &str, platform: Platform) -> String {
-    if cookies.contains('\t') {
+    if is_netscape_cookie_file(cookies) {
         return cookies.to_string();
     }
 
@@ -763,10 +865,166 @@ fn cookie_file(cookies: &str, platform: Platform) -> String {
     lines.join("\n")
 }
 
+fn is_netscape_cookie_file(cookies: &str) -> bool {
+    cookies.contains('\t')
+}
+
 fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     let head = value.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix)
         .then(|| &value[prefix.len()..])
+}
+
+fn cookie_path(dir: &Path, platform: Platform) -> PathBuf {
+    dir.join(format!("{}.txt", platform.name()))
+}
+
+/// Normalizes a `PUT /cookies/{platform}` body (raw `Cookie:` header or Netscape file).
+fn stored_cookie_contents(input: &str, platform: Platform) -> Result<String, ApiError> {
+    if input.len() > MAX_STORED_COOKIE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("cookie file too large (max {MAX_STORED_COOKIE_BYTES} bytes)"),
+        ));
+    }
+    if input.trim().is_empty() {
+        return Err(ApiError::bad_request("empty cookie body"));
+    }
+
+    let input = input.trim_end_matches(['\r', '\n']);
+    let contents = if is_netscape_cookie_file(input) {
+        let has_entry = input.lines().any(|line| {
+            let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+            !line.trim_start().starts_with('#') && line.split('\t').count() >= 7
+        });
+        if !has_entry {
+            return Err(ApiError::bad_request(
+                "cookie file has no entries (expected a Netscape cookie file)",
+            ));
+        }
+        format!("{input}\n")
+    } else {
+        let file = cookie_file(input, platform);
+        if file.lines().count() <= 1 {
+            return Err(ApiError::bad_request(
+                "no cookies found (send a Cookie header or a Netscape cookie file)",
+            ));
+        }
+        file
+    };
+    // Expansion of a raw header (one line per domain) can outgrow the input.
+    if contents.len() > MAX_STORED_COOKIE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("cookie file too large (max {MAX_STORED_COOKIE_BYTES} bytes)"),
+        ));
+    }
+    Ok(contents)
+}
+
+async fn stored_cookies(config: &Config, platform: Platform) -> Result<Option<String>, ApiError> {
+    let Some(dir) = &config.cookie_dir else {
+        return Ok(None);
+    };
+    match fs::read_to_string(cookie_path(dir, platform)).await {
+        Ok(contents) if !contents.trim().is_empty() => Ok(Some(contents)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ApiError::internal(format!(
+            "cannot read stored cookies for {}: {error}",
+            platform.name()
+        ))),
+    }
+}
+
+async fn ensure_cookie_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(COOKIE_DIR_MODE)).await?;
+    }
+    Ok(())
+}
+
+async fn write_cookie_file(path: &Path, contents: &str) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cookie path has no parent directory",
+        )
+    })?;
+    ensure_cookie_dir(dir).await?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cookies");
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let result = write_cookie_tmp(&tmp, path, contents).await;
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+async fn write_cookie_tmp(tmp: &Path, path: &Path, contents: &str) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(COOKIE_FILE_MODE);
+    let mut file = options.open(tmp).await?;
+    file.write_all(contents.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(tmp, std::fs::Permissions::from_mode(COOKIE_FILE_MODE)).await?;
+    }
+    fs::rename(tmp, path).await
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn authorize(config: &Config, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(token) = config.token.as_deref() else {
+        return Ok(());
+    };
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| strip_prefix_ignore_case(value.trim(), "bearer "))
+        .map(str::trim)
+        .or_else(|| {
+            headers
+                .get("x-ixian-token")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+        });
+    let authorized =
+        provided.is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()));
+    if authorized {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token (IXIAN_TOKEN)",
+        ))
+    }
+}
+
+fn system_time_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 /// yt-dlp prints one filepath per downloaded item. A tweet that quotes another
@@ -795,6 +1053,36 @@ fn parse_ms_value(value: Option<&Value>) -> Option<Duration> {
         }
         _ => None,
     }
+}
+
+/// `timeout_ms` is canonical; `timeoutMs` is accepted as an alias.
+fn checked_timeout(duration: Duration) -> Result<Duration, ApiError> {
+    if duration.as_millis() > u128::from(MAX_TIMEOUT_MS) {
+        return Err(ApiError::bad_request(format!(
+            "'timeout_ms' must be at most {MAX_TIMEOUT_MS} milliseconds"
+        )));
+    }
+    Ok(duration)
+}
+
+fn query_timeout(params: &HashMap<String, String>) -> Result<Option<Duration>, ApiError> {
+    let Some(value) = params.get("timeout_ms").or_else(|| params.get("timeoutMs")) else {
+        return Ok(None);
+    };
+    let duration = parse_ms(value).ok_or_else(|| {
+        ApiError::bad_request("'timeout_ms' must be a positive number of milliseconds")
+    })?;
+    checked_timeout(duration).map(Some)
+}
+
+fn json_timeout(object: &Map<String, Value>) -> Result<Option<Duration>, ApiError> {
+    let Some(value) = object.get("timeout_ms").or_else(|| object.get("timeoutMs")) else {
+        return Ok(None);
+    };
+    let duration = parse_ms_value(Some(value)).ok_or_else(|| {
+        ApiError::bad_request("'timeout_ms' must be a positive number of milliseconds")
+    })?;
+    checked_timeout(duration).map(Some)
 }
 
 /// Removes stray backslashes (e.g. from copy-pasted urls like `\?utm_source\=x`) while keeping valid JSON escapes.
@@ -838,6 +1126,106 @@ struct DownloadedMedia {
     platform: Platform,
     hint: Option<&'static str>,
     cleanup: Cleanup,
+    permit: OwnedSemaphorePermit,
+}
+
+/// Creates the per-download directory with `0700` from the first syscall.
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Creates the cookie jar with `0600` atomically (`create_new`), so it is never
+/// readable by other users, not even for an instant.
+fn write_cookie_jar(path: &Path, contents: &str) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+/// Kills the whole process group led by `pid` (yt-dlp and its ffmpeg children).
+#[cfg(unix)]
+fn signal_process_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: a negative pid signals the process group led by `pid`.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_pid: u32) {}
+
+/// Kills the child's process group if the download future is dropped (client
+/// disconnect) or if it was not disarmed after a normal exit.
+struct ProcessGroup {
+    pid: u32,
+    armed: bool,
+}
+
+impl ProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pid: pid.unwrap_or(0),
+            armed: pid.is_some_and(|pid| pid > 0),
+        }
+    }
+
+    fn kill(&self) {
+        if self.armed {
+            signal_process_group(self.pid);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Keeps lossy UTF-8 conversion from growing past the byte cap.
+fn truncate_to_bytes(mut text: String, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        let mut end = max_bytes;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// Waits for a pipe reader, but never longer than [`PIPE_DRAIN_TIMEOUT`] after
+/// the child exited: a grandchild can keep the pipe open indefinitely.
+async fn drain_pipe(handle: tokio::task::JoinHandle<io::Result<String>>) -> (Option<String>, bool) {
+    let mut handle = handle;
+    tokio::select! {
+        joined = &mut handle => match joined {
+            Ok(Ok(text)) => (Some(text), false),
+            Ok(Err(_)) | Err(_) => (None, false),
+        },
+        _ = tokio::time::sleep(PIPE_DRAIN_TIMEOUT) => {
+            handle.abort();
+            (None, true)
+        }
+    }
 }
 
 /// Removes the per-download temp directory (media, cookie jar, yt-dlp fragments).
@@ -861,6 +1249,7 @@ impl Drop for Cleanup {
 struct TempFileReader {
     file: fs::File,
     _cleanup: Cleanup,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl AsyncRead for TempFileReader {
@@ -877,28 +1266,46 @@ impl AsyncRead for TempFileReader {
 async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedMedia, ApiError> {
     let platform = request.platform;
     let url = request.url.replace('\\', "");
-    let has_cookies = request
+    let cookies = request
         .cookies
+        .clone()
+        .filter(|cookies| !cookies.trim().is_empty());
+    if cookies
         .as_deref()
-        .is_some_and(|cookies| !cookies.is_empty());
+        .is_some_and(|cookies| cookies.len() > MAX_COOKIE_BYTES)
+    {
+        return Err(ApiError::too_large(format!(
+            "cookies exceed the {MAX_COOKIE_BYTES} byte limit"
+        )));
+    }
+    let cookies = match cookies {
+        Some(cookies) => Some(cookies),
+        None => stored_cookies(config, platform).await?,
+    };
+    let has_cookies = cookies.is_some();
     let hint = has_cookies.then_some(COOKIE_HINT);
+    let permit = config.downloads.clone().try_acquire_owned().map_err(|_| {
+        ApiError::too_many_requests(format!(
+            "too many concurrent downloads (limit: {MAX_CONCURRENT})"
+        ))
+    })?;
 
     let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
-    fs::create_dir(&dir)
-        .await
+    create_private_dir(&dir)
         .map_err(|error| ApiError::internal(format!("cannot create temp directory: {error}")))?;
     let jar = dir.join("cookies.txt");
     let cleanup = Cleanup::new(dir.clone());
-    if has_cookies {
-        let contents = cookie_file(request.cookies.as_deref().unwrap_or_default(), platform);
-        fs::write(&jar, contents)
-            .await
-            .map_err(|error| ApiError::internal(format!("cannot write cookie jar: {error}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&jar, std::fs::Permissions::from_mode(0o600)).await;
+    if let Some(cookies) = cookies.as_deref() {
+        let contents = cookie_file(cookies, platform);
+        // Stored cookie files may be larger than a request cookie; both are
+        // bounded well below the body limit.
+        if contents.len() > MAX_STORED_COOKIE_BYTES {
+            return Err(ApiError::too_large(format!(
+                "cookies exceed the {MAX_STORED_COOKIE_BYTES} byte limit"
+            )));
         }
+        write_cookie_jar(&jar, &contents)
+            .map_err(|error| ApiError::internal(format!("cannot write cookie jar: {error}")))?;
     }
 
     let mut cmd = Command::new(&config.ytdlp);
@@ -913,6 +1320,12 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
         .arg("after_move:filepath")
         .arg("--merge-output-format")
         .arg("mp4")
+        .arg("--socket-timeout")
+        .arg(SOCKET_TIMEOUT_SECS.to_string())
+        .arg("--retries")
+        .arg(RETRIES.to_string())
+        .arg("--max-filesize")
+        .arg(config.max_filesize.to_string())
         .arg("-f")
         .arg(request.format.as_deref().unwrap_or(&config.format))
         .arg("-o")
@@ -920,6 +1333,8 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
     if let Some(plugin_dir) = &config.plugin_dir {
         cmd.arg("--plugin-dirs").arg(plugin_dir);
     }
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -927,17 +1342,19 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
     if has_cookies {
         cmd.arg("--cookies").arg(&jar);
     }
-    cmd.arg(&url);
+    // `--` terminates option parsing so a leading dash can never become a flag.
+    cmd.arg("--").arg(&url);
 
     let mut child = cmd
         .spawn()
         .map_err(|error| ApiError::bad_gateway(format!("failed to run yt-dlp: {error}"), None))?;
+    let mut group = ProcessGroup::new(child.id());
 
     let mut stdout_pipe = child
         .stdout
         .take()
         .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stdout"))?;
-    let mut stderr_pipe = child
+    let stderr_pipe = child
         .stderr
         .take()
         .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stderr"))?;
@@ -946,22 +1363,29 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
         stdout_pipe.read_to_string(&mut text).await.map(|_| text)
     });
     let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        stderr_pipe.read_to_string(&mut text).await.map(|_| text)
+        let mut buf = Vec::new();
+        let mut limited = stderr_pipe.take(MAX_STDERR_BYTES as u64);
+        limited.read_to_end(&mut buf).await.map(|_| {
+            let text = String::from_utf8_lossy(&buf);
+            truncate_to_bytes(text.trim_end().to_string(), MAX_STDERR_BYTES)
+        })
     });
 
     let limit = request.timeout.unwrap_or(config.timeout);
     let status = match timeout(limit, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
+            group.kill();
             return Err(ApiError::bad_gateway(
                 format!("failed to wait for yt-dlp: {error}"),
                 hint,
             ));
         }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            group.kill();
+            if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
+                group.disarm();
+            }
             // Do not wait on the pipes: yt-dlp's children (ffmpeg, curl) can keep them open.
             stdout_task.abort();
             stderr_task.abort();
@@ -972,16 +1396,15 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
         }
     };
 
-    let stdout = stdout_task
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    let stderr = stderr_task
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    // yt-dlp exited, but a grandchild may still hold the pipes open.
+    let ((stdout, stdout_stalled), (stderr, stderr_stalled)) =
+        tokio::join!(drain_pipe(stdout_task), drain_pipe(stderr_task));
+    if stdout_stalled || stderr_stalled {
+        group.kill();
+    }
+    group.disarm();
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
 
     let path = primary_filepath(&stdout);
     let media = match path {
@@ -1008,6 +1431,16 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
             hint,
         ));
     }
+    if metadata.len() > config.max_filesize {
+        return Err(ApiError::bad_gateway(
+            format!(
+                "output file is {} bytes, over the {} byte limit",
+                metadata.len(),
+                config.max_filesize
+            ),
+            hint,
+        ));
+    }
 
     let name = media
         .file_name()
@@ -1024,30 +1457,33 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
         platform,
         hint,
         cleanup,
+        permit,
     })
 }
 
 async fn download(
     config: &Config,
-    request: DownloadRequest,
+    mut request: DownloadRequest,
     method: Method,
     headers: HeaderMap,
 ) -> ApiResult {
-    let request = DownloadRequest {
-        url: request.url.replace('\\', ""),
-        ..request
-    };
+    request.url = request.url.replace('\\', "");
     let Some(cache) = &config.cache else {
         let media = fetch(config, &request).await?;
         return stream_media(media, request.inline).await;
     };
 
+    // Stored cookies change the response, so they are part of the cache key too.
+    let effective_cookies = match request.cookies.as_deref().map(str::trim) {
+        Some(cookies) if !cookies.is_empty() => request.cookies.clone(),
+        _ => stored_cookies(config, request.platform).await?,
+    };
     let format = request.format.as_deref().unwrap_or(&config.format);
     let key = cache_key(
         request.platform,
         &request.url,
         format,
-        request.cookies.as_deref(),
+        effective_cookies.as_deref(),
     );
     let key_lock = cache.key_lock(&key);
     let _guard = key_lock.lock().await;
@@ -1075,6 +1511,7 @@ async fn stream_media(media: DownloadedMedia, inline: bool) -> ApiResult {
         platform,
         hint,
         cleanup,
+        permit,
     } = media;
     let file = fs::File::open(&path).await.map_err(|error| {
         ApiError::bad_gateway(format!("cannot read output file: {error}"), hint)
@@ -1095,6 +1532,7 @@ async fn stream_media(media: DownloadedMedia, inline: bool) -> ApiResult {
     let reader = TempFileReader {
         file,
         _cleanup: cleanup,
+        _permit: permit,
     };
     let body = Body::from_stream(ReaderStream::with_capacity(reader, STREAM_CHUNK));
     let mut response = Response::new(body);
@@ -1176,24 +1614,35 @@ async fn download_get(
         url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .into_owned()
             .collect();
+    if let Some((name, _)) = params
+        .iter()
+        .find(|(name, _)| GET_COOKIE_PARAMS.contains(&name.as_str()))
+    {
+        return Err(ApiError::bad_request_with_hint(
+            format!("'{name}' is not accepted in GET query strings"),
+            GET_COOKIE_HINT,
+        ));
+    }
+
     let url = params
         .get("url")
         .map(String::as_str)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| ApiError::bad_request("missing 'url' query parameter"))?;
-    let platform = resolve_platform(url, params.get("platform").map(String::as_str))?;
+    let (url, platform) = validate_url(url, params.get("platform").map(String::as_str))?;
+    let timeout = query_timeout(&params)?;
 
     download(
         &config,
         DownloadRequest {
-            url: url.to_string(),
+            url,
             platform,
-            cookies: params.get(&format!("{}_cookies", platform.name())).cloned(),
+            cookies: None,
             format: params
                 .get("format")
                 .filter(|format| !format.is_empty())
                 .cloned(),
-            timeout: params.get("timeout_ms").and_then(|value| parse_ms(value)),
+            timeout,
             inline: params.get("inline").is_some_and(|value| parse_bool(value)),
         },
         method,
@@ -1223,7 +1672,8 @@ async fn download_post(
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| ApiError::bad_request("missing 'url' in JSON body"))?;
-    let platform = resolve_platform(url, object.get("platform").and_then(Value::as_str))?;
+    let (url, platform) = validate_url(url, object.get("platform").and_then(Value::as_str))?;
+    let timeout = json_timeout(object)?;
 
     let cookies = object
         .get("cookies")
@@ -1240,7 +1690,7 @@ async fn download_post(
     download(
         &config,
         DownloadRequest {
-            url: url.to_string(),
+            url,
             platform,
             cookies,
             format: object
@@ -1248,44 +1698,13 @@ async fn download_post(
                 .and_then(Value::as_str)
                 .filter(|format| !format.is_empty())
                 .map(str::to_string),
-            timeout: parse_ms_value(object.get("timeoutMs")),
+            timeout,
             inline: parse_bool_value(object.get("inline")),
         },
         method,
         headers,
     )
     .await
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |equal, (left, right)| equal | (left ^ right))
-        == 0
-}
-
-fn authorize(config: &Config, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(expected) = config.token.as_deref() else {
-        return Ok(());
-    };
-    let provided = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, token)| token.trim())
-        .or_else(|| {
-            headers
-                .get("x-ixian-token")
-                .and_then(|value| value.to_str().ok())
-        });
-    match provided {
-        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => Ok(()),
-        _ => Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized")),
-    }
 }
 
 async fn cache_stats(
@@ -1318,6 +1737,96 @@ async fn cache_clear(
     }
 }
 
+fn cookie_store_dir(config: &Config) -> Result<&Path, ApiError> {
+    config
+        .cookie_dir
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("cookie store disabled; set IXIAN_COOKIE_DIR"))
+}
+
+async fn list_cookies(State(config): State<Arc<Config>>) -> Json<Value> {
+    let mut cookies = Vec::with_capacity(Platform::ALL.len());
+    for platform in Platform::ALL {
+        let metadata = match &config.cookie_dir {
+            Some(dir) => fs::metadata(cookie_path(dir, platform))
+                .await
+                .ok()
+                .filter(|metadata| metadata.is_file()),
+            None => None,
+        };
+        let mut entry = json!({
+            "platform": platform.name(),
+            "present": metadata.is_some(),
+        });
+        let mtime = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_secs);
+        if let Some(mtime) = mtime {
+            entry["mtime"] = json!(mtime);
+        }
+        cookies.push(entry);
+    }
+
+    Json(json!({
+        "enabled": config.cookie_dir.is_some(),
+        "cookies": cookies,
+    }))
+}
+
+async fn put_cookie(
+    State(config): State<Arc<Config>>,
+    UrlPath(platform): UrlPath<String>,
+    headers: HeaderMap,
+    body: String,
+) -> ApiResult {
+    authorize(&config, &headers)?;
+    let platform = parse_platform(&platform)?;
+    let dir = cookie_store_dir(&config)?;
+    let contents = stored_cookie_contents(&body, platform)?;
+    let path = cookie_path(dir, platform);
+    write_cookie_file(&path, &contents)
+        .await
+        .map_err(|error| ApiError::internal(format!("cannot store cookies: {error}")))?;
+    let mtime = fs::metadata(&path)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_secs);
+
+    Ok(Json(json!({
+        "platform": platform.name(),
+        "stored": true,
+        "mtime": mtime,
+    }))
+    .into_response())
+}
+
+async fn delete_cookie(
+    State(config): State<Arc<Config>>,
+    UrlPath(platform): UrlPath<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    authorize(&config, &headers)?;
+    let platform = parse_platform(&platform)?;
+    let dir = cookie_store_dir(&config)?;
+    let deleted = match fs::remove_file(cookie_path(dir, platform)).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "cannot delete stored cookies: {error}"
+            )));
+        }
+    };
+
+    Ok(Json(json!({
+        "platform": platform.name(),
+        "deleted": deleted,
+    }))
+    .into_response())
+}
+
 async fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not found")
 }
@@ -1332,9 +1841,11 @@ fn app(config: Arc<Config>) -> Router {
         .route("/download", get(download_get).post(download_post))
         .route("/cache/stats", get(cache_stats))
         .route("/cache", delete(cache_clear))
+        .route("/cookies", get(list_cookies))
+        .route("/cookies/{platform}", put(put_cookie).delete(delete_cookie))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(config)
 }
 
@@ -1382,22 +1893,73 @@ mod tests {
             detect_platform("https://www.instagram.com/reel/abc/"),
             Some(Platform::Instagram)
         );
+        for url in [
+            "https://www.tiktok.com/@user/video/123",
+            "https://tiktok.com/@user/video/123",
+            "https://vm.tiktok.com/ZMabc/",
+            "https://vt.tiktok.com/ZMabc/",
+        ] {
+            assert_eq!(detect_platform(url), Some(Platform::TikTok), "{url}");
+        }
         assert_eq!(detect_platform("https://example.com/video"), None);
         assert_eq!(detect_platform("not a url"), None);
     }
 
     #[test]
-    fn platform_override_wins_and_validates() {
+    fn platform_override_still_enforces_the_host_allowlist() {
         assert_eq!(
-            resolve_platform("https://example.com/v", Some("instagram")).unwrap(),
+            validate_url("https://www.instagram.com/reel/abc/", Some("instagram"))
+                .unwrap()
+                .1,
             Platform::Instagram
         );
-        assert!(resolve_platform("https://example.com/v", Some("tiktok")).is_err());
         assert_eq!(
-            resolve_platform("https://example.com/v", Some(""))
+            validate_url("https://vm.tiktok.com/ZMabc/", Some("tiktok"))
+                .unwrap()
+                .1,
+            Platform::TikTok
+        );
+        assert!(validate_url("https://example.com/v", Some("vimeo")).is_err());
+        assert_eq!(
+            validate_url("http://127.0.0.1/video", Some("youtube"))
                 .unwrap_err()
                 .status,
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_url("https://x.com/user/status/1", Some("youtube"))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(validate_url("https://example.com/v", Some("tiktok")).is_err());
+        assert_eq!(
+            validate_url("https://example.com/v", Some(""))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_urls_and_cleans_backslashes() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://youtu.be/abc",
+            "javascript:alert(1)",
+            "--exec=rm -rf /",
+        ] {
+            assert_eq!(
+                validate_url(url, Some("youtube")).unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+                "{url}"
+            );
+        }
+        assert_eq!(
+            validate_url(r"https://www.youtube.com/watch\?v\=abc", None)
+                .unwrap()
+                .0,
+            "https://www.youtube.com/watch?v=abc"
         );
     }
 
@@ -1417,6 +1979,40 @@ mod tests {
         let netscape =
             "# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tx\n";
         assert_eq!(cookie_file(netscape, Platform::Instagram), netscape);
+    }
+
+    #[test]
+    fn builds_tiktok_cookie_file_from_header() {
+        let file = cookie_file(
+            "Cookie: sessionid=abc; tt_chain_token=d=ef",
+            Platform::TikTok,
+        );
+        assert!(file.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\tabc"));
+        assert!(file.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\ttt_chain_token\td=ef"));
+        assert!(!file.contains(".instagram.com"));
+    }
+
+    #[test]
+    fn normalizes_cookie_store_inputs() {
+        let file = stored_cookie_contents("Cookie: sessionid=abc", Platform::TikTok).unwrap();
+        assert!(file.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\tabc"));
+
+        let netscape = "# Netscape HTTP Cookie File\n\
+                        #HttpOnly_.tiktok.com\tTRUE\t/\tTRUE\t0\tsessionid\tx\n";
+        assert_eq!(
+            stored_cookie_contents(netscape, Platform::TikTok).unwrap(),
+            netscape
+        );
+        assert_eq!(
+            stored_cookie_contents(netscape.trim_end(), Platform::TikTok).unwrap(),
+            netscape
+        );
+        assert!(stored_cookie_contents("  \n", Platform::TikTok).is_err());
+        assert!(stored_cookie_contents("# Netscape HTTP Cookie File\n", Platform::TikTok).is_err());
+        assert!(
+            stored_cookie_contents(&"a".repeat(MAX_STORED_COOKIE_BYTES + 1), Platform::TikTok)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1452,6 +2048,49 @@ mod tests {
     }
 
     #[test]
+    fn creates_temp_dir_0700_and_cookie_jar_0600_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let dir = parent.path().join("ixian-test");
+        create_private_dir(&dir).unwrap();
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        let jar = dir.join("cookies.txt");
+        write_cookie_jar(&jar, "cookie data").unwrap();
+        let jar_mode = std::fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(jar_mode, 0o600);
+        // `create_new` refuses to reuse an existing file.
+        assert!(write_cookie_jar(&jar, "other").is_err());
+        assert_eq!(std::fs::read_to_string(&jar).unwrap(), "cookie data");
+    }
+
+    #[test]
+    fn caps_timeouts() {
+        assert_eq!(
+            checked_timeout(Duration::from_millis(MAX_TIMEOUT_MS)).unwrap(),
+            Duration::from_millis(MAX_TIMEOUT_MS)
+        );
+        assert!(checked_timeout(Duration::from_millis(MAX_TIMEOUT_MS + 1)).is_err());
+
+        let params = HashMap::from([("timeoutMs".to_string(), "1500".to_string())]);
+        assert_eq!(
+            query_timeout(&params).unwrap(),
+            Some(Duration::from_millis(1500))
+        );
+        let params = HashMap::from([("timeout_ms".to_string(), "nope".to_string())]);
+        assert!(query_timeout(&params).is_err());
+    }
+
+    #[test]
+    fn truncates_stderr_on_a_char_boundary() {
+        assert_eq!(truncate_to_bytes("abcdef".into(), 3), "abc");
+        assert_eq!(truncate_to_bytes("é".into(), 1), "");
+        assert_eq!(truncate_to_bytes("ok".into(), 10), "ok");
+    }
+
+    #[test]
     fn maps_output_extensions_to_mime_types() {
         assert_eq!(
             mime_guess::from_path("/tmp/a.mp4")
@@ -1466,7 +2105,6 @@ mod tests {
             "video/webm"
         );
     }
-
     #[test]
     fn normalizes_urls_for_cache_keys() {
         assert_eq!(
@@ -1488,6 +2126,10 @@ mod tests {
         assert_eq!(
             normalized_url("https://example.com/v?b=2&a=1"),
             "https://example.com/v?a=1&b=2"
+        );
+        assert_eq!(
+            normalized_url("https://vm.tiktok.com/ZMabc/?is_from_webapp=1&sender_device=pc"),
+            "https://tiktok.com/ZMabc"
         );
     }
 
@@ -1575,6 +2217,9 @@ printf 'run\n' >> "$LOG/runs.txt"
 if [ -n "$jar" ]; then cp -p "$jar" "$LOG/jar.txt"; fi
 {extra}
 prefix="${{out%%\%*}}"
+dir="${{prefix%/}}"
+mode=$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir")
+printf '%s\n' "$mode" > "$LOG/dirmode.txt"
 printf 'partial' > "${{prefix}}partial.part"
 printf 'fake video data' > "${{prefix}}fake.mp4"
 printf '%s\n' "${{prefix}}fake.mp4"
@@ -1587,7 +2232,15 @@ printf '%s\n' "${{prefix}}fake.mp4"
         }
 
         fn config(&self, timeout: Duration) -> Arc<Config> {
-            self.config_with(timeout, None, None, None)
+            self.config_full(
+                timeout,
+                None,
+                None,
+                None,
+                None,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
         }
 
         fn config_with_plugin_dir(
@@ -1595,11 +2248,62 @@ printf '%s\n' "${{prefix}}fake.mp4"
             timeout: Duration,
             plugin_dir: Option<PathBuf>,
         ) -> Arc<Config> {
-            self.config_with(timeout, plugin_dir, None, None)
+            self.config_full(
+                timeout,
+                plugin_dir,
+                None,
+                None,
+                None,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
+        }
+
+        fn config_with_cookie_store(
+            &self,
+            timeout: Duration,
+            cookie_dir: PathBuf,
+            token: Option<&str>,
+        ) -> Arc<Config> {
+            self.config_full(
+                timeout,
+                None,
+                Some(cookie_dir),
+                None,
+                token.map(str::to_string),
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
+        }
+
+        fn config_with_limits(
+            &self,
+            plugin_dir: Option<PathBuf>,
+            timeout: Duration,
+            concurrency: usize,
+            max_filesize: u64,
+        ) -> Arc<Config> {
+            self.config_full(
+                timeout,
+                plugin_dir,
+                None,
+                None,
+                None,
+                concurrency,
+                max_filesize,
+            )
         }
 
         fn config_with_cache(&self, cache: Cache) -> Arc<Config> {
-            self.config_with(Duration::from_secs(30), None, Some(cache), None)
+            self.config_full(
+                Duration::from_secs(30),
+                None,
+                None,
+                Some(cache),
+                None,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
         }
 
         fn config_with(
@@ -1608,6 +2312,28 @@ printf '%s\n' "${{prefix}}fake.mp4"
             plugin_dir: Option<PathBuf>,
             cache: Option<Cache>,
             token: Option<String>,
+        ) -> Arc<Config> {
+            self.config_full(
+                timeout,
+                plugin_dir,
+                None,
+                cache,
+                token,
+                MAX_CONCURRENT,
+                MAX_FILESIZE,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn config_full(
+            &self,
+            timeout: Duration,
+            plugin_dir: Option<PathBuf>,
+            cookie_dir: Option<PathBuf>,
+            cache: Option<Cache>,
+            token: Option<String>,
+            concurrency: usize,
+            max_filesize: u64,
         ) -> Arc<Config> {
             Arc::new(Config {
                 host: "127.0.0.1".into(),
@@ -1618,7 +2344,10 @@ printf '%s\n' "${{prefix}}fake.mp4"
                 timeout,
                 tmp: self.tmp.path().to_path_buf(),
                 cache,
+                cookie_dir,
                 token,
+                downloads: Arc::new(Semaphore::new(concurrency)),
+                max_filesize,
             })
         }
 
@@ -1629,13 +2358,51 @@ printf '%s\n' "${{prefix}}fake.mp4"
         }
     }
 
+    fn query(params: &[(&str, &str)]) -> String {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in params {
+            serializer.append_pair(name, value);
+        }
+        format!("/download?{}", serializer.finish())
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    async fn assert_process_dies(pid: u32) {
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("process {pid} survived");
+    }
+
+    async fn wait_for_file(path: &Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} was not created", path.display());
+    }
+
     async fn request(
         app: Router,
         method: Method,
         uri: &str,
         body: Option<String>,
     ) -> (StatusCode, HeaderMap, Vec<u8>) {
-        request_with_headers(app, method, uri, body, &[]).await
+        request_with_headers(app, method, uri, body, HeaderMap::new()).await
     }
 
     async fn request_with_headers(
@@ -1643,14 +2410,14 @@ printf '%s\n' "${{prefix}}fake.mp4"
         method: Method,
         uri: &str,
         body: Option<String>,
-        extra_headers: &[(&str, &str)],
+        headers: HeaderMap,
     ) -> (StatusCode, HeaderMap, Vec<u8>) {
         let mut builder = Request::builder().method(method).uri(uri);
         if body.is_some() {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
         }
-        for (name, value) in extra_headers {
-            builder = builder.header(*name, *value);
+        for (name, value) in &headers {
+            builder = builder.header(name, value);
         }
         let request = builder.body(Body::from(body.unwrap_or_default())).unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -1685,6 +2452,8 @@ printf '%s\n' "${{prefix}}fake.mp4"
         );
         assert!(!disposition.contains("ixian-"), "{disposition}");
         assert_eq!(body, b"fake video data");
+        let dir_mode = stdfs::read_to_string(harness.logs.path().join("dirmode.txt")).unwrap();
+        assert_eq!(dir_mode.trim(), "700");
         tokio::task::yield_now().await;
         assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
     }
@@ -1809,7 +2578,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "missing 'url' query parameter");
 
-        let payload = r#"{"url":"https://example.com/video","platform":"tiktok"}"#.to_string();
+        let payload = r#"{"url":"https://example.com/video","platform":"vimeo"}"#.to_string();
         let (status, _, body) =
             request(app.clone(), Method::POST, "/download", Some(payload)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1837,6 +2606,519 @@ printf '%s\n' "${{prefix}}fake.mp4"
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "method not allowed");
+    }
+
+    #[tokio::test]
+    async fn downloads_tiktok_with_default_format() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://vm.tiktok.com/ZMabc/" }).to_string();
+
+        let (status, headers, _) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["x-ixian-platform"].to_str().unwrap(), "tiktok");
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        let index = lines.iter().position(|arg| *arg == "-f").unwrap();
+        assert_eq!(lines[index + 1], DEFAULT_FORMAT);
+    }
+
+    #[tokio::test]
+    async fn auto_loads_stored_cookies_and_request_cookies_win() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        stdfs::create_dir(&dir).unwrap();
+        stdfs::write(
+            dir.join("youtube.txt"),
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tfrom-file\n",
+        )
+        .unwrap();
+        let app = app(harness.config_with_cookie_store(Duration::from_secs(30), dir, None));
+
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let (status, _, _) = request(app.clone(), Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let jar = stdfs::read_to_string(harness.logs.path().join("jar.txt")).unwrap();
+        assert!(jar.contains("SID\tfrom-file"), "{jar}");
+
+        let payload = serde_json::json!({
+            "url": "https://youtu.be/abc",
+            "youtube_cookies": "SID=from-request",
+        })
+        .to_string();
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let jar = stdfs::read_to_string(harness.logs.path().join("jar.txt")).unwrap();
+        assert!(jar.contains("SID\tfrom-request"), "{jar}");
+        assert!(!jar.contains("from-file"), "{jar}");
+    }
+
+    #[tokio::test]
+    async fn stores_lists_and_deletes_cookies_without_returning_values() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        let app = app(harness.config_with_cookie_store(Duration::from_secs(30), dir.clone(), None));
+
+        let (status, _, _) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/tiktok",
+            Some("# Netscape HTTP Cookie File\n".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!dir.exists());
+
+        let (status, _, body) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/tiktok",
+            Some("Cookie: sessionid=secret-value; tt_chain_token=chain".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let stored: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stored["platform"], "tiktok");
+        assert_eq!(stored["stored"], true);
+        assert!(stored["mtime"].is_u64());
+
+        let file = dir.join("tiktok.txt");
+        let contents = stdfs::read_to_string(&file).unwrap();
+        assert!(
+            contents.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\tsecret-value")
+        );
+        assert_eq!(
+            stdfs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            stdfs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(stdfs::read_dir(&dir).unwrap().count(), 1);
+
+        let (status, _, body) = request(app.clone(), Method::GET, "/cookies", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(!text.contains("secret-value"), "{text}");
+        assert!(!text.contains("chain"), "{text}");
+        let listed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["enabled"], true);
+        assert_eq!(
+            listed["cookies"].as_array().unwrap().len(),
+            Platform::ALL.len()
+        );
+        let tiktok = listed["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["platform"] == "tiktok")
+            .unwrap();
+        assert_eq!(tiktok["present"], true);
+        assert!(tiktok["mtime"].is_u64());
+        assert_eq!(
+            listed["cookies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["platform"] == "youtube")
+                .unwrap()["present"],
+            false
+        );
+
+        let (status, _, body) = request(app.clone(), Method::DELETE, "/cookies/tiktok", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["deleted"],
+            true
+        );
+        assert!(!file.exists());
+
+        let (status, _, body) = request(app.clone(), Method::DELETE, "/cookies/tiktok", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["deleted"],
+            false
+        );
+
+        let (status, _, body) =
+            request(app, Method::PUT, "/cookies/vimeo", Some("a=b".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("unknown platform"));
+    }
+
+    #[tokio::test]
+    async fn requires_bearer_token_for_cookie_writes_when_configured() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        let app = app(harness.config_with_cookie_store(
+            Duration::from_secs(30),
+            dir.clone(),
+            Some("s3cret"),
+        ));
+
+        let (status, _, _) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/x",
+            Some("auth_token=abc".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        let (status, _, _) = request_with_headers(
+            app.clone(),
+            Method::PUT,
+            "/cookies/x",
+            Some("auth_token=abc".into()),
+            headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer s3cret"),
+        );
+        let (status, _, _) = request_with_headers(
+            app.clone(),
+            Method::PUT,
+            "/cookies/x",
+            Some("auth_token=abc".into()),
+            headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(dir.join("x.txt").exists());
+
+        let (status, _, _) = request(app.clone(), Method::GET, "/cookies", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = request(app, Method::DELETE, "/cookies/x", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(dir.join("x.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn cookie_writes_require_a_cookie_dir() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        let (status, _, body) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/youtube",
+            Some("SID=a".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("IXIAN_COOKIE_DIR"));
+
+        let (status, _, body) = request(app.clone(), Method::GET, "/cookies", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["enabled"], false);
+        assert!(listed["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["present"] == false));
+
+        let (status, _, _) = request(app, Method::DELETE, "/cookies/youtube", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn passes_hardening_flags_and_double_dash() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload =
+            serde_json::json!({ "url": "https://www.youtube.com/watch?v=abc" }).to_string();
+
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert_eq!(lines[lines.len() - 2], "--");
+        assert_eq!(
+            lines[lines.len() - 1],
+            "https://www.youtube.com/watch?v=abc"
+        );
+        let value_of = |flag: &str| {
+            let index = lines.iter().position(|arg| *arg == flag).unwrap();
+            lines[index + 1]
+        };
+        assert_eq!(
+            value_of("--socket-timeout"),
+            SOCKET_TIMEOUT_SECS.to_string()
+        );
+        assert_eq!(value_of("--retries"), RETRIES.to_string());
+        assert_eq!(value_of("--max-filesize"), MAX_FILESIZE.to_string());
+    }
+
+    #[tokio::test]
+    async fn rejects_cookies_on_get() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let uri = query(&[
+            ("url", "https://x.com/user/status/1"),
+            ("x_cookies", "auth_token=secret"),
+        ]);
+
+        let (status, _, body) = request(app, Method::GET, &uri, None).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(error["hint"].as_str().unwrap().contains("POST"), "{error}");
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_urls_outside_the_platform_allowlist() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        let uri = query(&[("url", "http://127.0.0.1/video"), ("platform", "youtube")]);
+        let (status, _, body) = request(app.clone(), Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("not allowed"),
+            "{error}"
+        );
+
+        for (url, platform) in [
+            ("https://x.com/user/status/1", "youtube"),
+            ("file:///etc/passwd", "youtube"),
+            ("ftp://youtu.be/abc", "youtube"),
+            ("--exec=rm -rf /", "youtube"),
+        ] {
+            let payload = serde_json::json!({ "url": url, "platform": platform }).to_string();
+            let (status, _, _) =
+                request(app.clone(), Method::POST, "/download", Some(payload)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}");
+        }
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn accepts_both_timeout_names() {
+        let harness = Harness::new("sleep 5");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        for name in ["timeout_ms", "timeoutMs"] {
+            let uri = query(&[("url", "https://youtu.be/abc"), (name, "100")]);
+            let started = std::time::Instant::now();
+            let (status, _, _) = request(app.clone(), Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "GET {name}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        for name in ["timeout_ms", "timeoutMs"] {
+            let payload = if name == "timeout_ms" {
+                serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": 100 }).to_string()
+            } else {
+                serde_json::json!({ "url": "https://youtu.be/abc", "timeoutMs": 100 }).to_string()
+            };
+            let started = std::time::Instant::now();
+            let (status, _, _) =
+                request(app.clone(), Method::POST, "/download", Some(payload)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "POST {name}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_and_oversized_timeouts() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        for payload in [
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": "nope" }),
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeoutMs": 0 }),
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": MAX_TIMEOUT_MS + 1 }),
+        ] {
+            let (status, _, _) = request(
+                app.clone(),
+                Method::POST,
+                "/download",
+                Some(payload.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+        }
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_cookies() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({
+            "url": "https://x.com/user/status/1",
+            "cookies": { "x": "a".repeat(MAX_COOKIE_BYTES + 1) },
+        })
+        .to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("cookie"),
+            "{error}"
+        );
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounds_stderr_capture() {
+        let harness = Harness::new("yes x | head -c 100000 >&2; exit 1");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        let message = error["error"].as_str().unwrap();
+        assert!(!message.is_empty());
+        assert!(
+            message.len() <= MAX_STDERR_BYTES,
+            "stderr was {} bytes",
+            message.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_output_over_max_filesize() {
+        let harness = Harness::new("");
+        let app = app(harness.config_with_limits(None, Duration::from_secs(30), MAX_CONCURRENT, 4));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("limit"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_429_when_concurrency_is_exhausted() {
+        let harness = Harness::new("sleep 30");
+        let app = app(harness.config_with_limits(None, Duration::from_secs(60), 1, MAX_FILESIZE));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let first = tokio::spawn(request(
+            app.clone(),
+            Method::POST,
+            "/download",
+            Some(payload.clone()),
+        ));
+        wait_for_file(&harness.logs.path().join("args.txt")).await;
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("concurrent"),
+            "{error}"
+        );
+        first.abort();
+        let _ = first.await;
+    }
+
+    #[tokio::test]
+    async fn kills_process_group_on_timeout() {
+        let harness = Harness::new("sleep 30 & echo $! > \"$LOG/grandchild.pid\"; sleep 30");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload =
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": 1000 }).to_string();
+
+        let started = std::time::Instant::now();
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("timed out"),
+            "{error}"
+        );
+        let pid = stdfs::read_to_string(harness.logs.path().join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_dies(pid).await;
+    }
+
+    #[tokio::test]
+    async fn kills_process_group_when_request_is_cancelled() {
+        let harness = Harness::new("sleep 30 & echo $! > \"$LOG/grandchild.pid\"; sleep 30");
+        let app = app(harness.config(Duration::from_secs(60)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let task = tokio::spawn(request(app, Method::POST, "/download", Some(payload)));
+        wait_for_file(&harness.logs.path().join("grandchild.pid")).await;
+
+        task.abort();
+        let _ = task.await;
+
+        let pid = stdfs::read_to_string(harness.logs.path().join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_dies(pid).await;
+    }
+
+    #[tokio::test]
+    async fn bounds_post_exit_pipe_drain() {
+        let harness = Harness::new("sleep 30 1>/dev/null & echo $! > \"$LOG/grandchild.pid\"");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let started = std::time::Instant::now();
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(body, b"fake video data");
+        let pid = stdfs::read_to_string(harness.logs.path().join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_dies(pid).await;
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
     }
 
     fn disk_cache(dir: &TempDir, ttl: Option<Duration>, max_bytes: Option<u64>) -> Cache {
@@ -1911,7 +3193,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             Method::GET,
             uri,
             None,
-            &[(header::RANGE.as_str(), "bytes=0-3")],
+            header_map(&[(header::RANGE.as_str(), "bytes=0-3")]),
         )
         .await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
@@ -1925,7 +3207,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             Method::GET,
             uri,
             None,
-            &[(header::RANGE.as_str(), "bytes=5-9")],
+            header_map(&[(header::RANGE.as_str(), "bytes=5-9")]),
         )
         .await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
@@ -1946,7 +3228,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
             Method::GET,
             uri,
             None,
-            &[(header::IF_NONE_MATCH.as_str(), etag.as_str())],
+            header_map(&[(header::IF_NONE_MATCH.as_str(), etag.as_str())]),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_MODIFIED);
@@ -2032,9 +3314,10 @@ printf '%s\n' "${{prefix}}fake.mp4"
         let (status, _, _) = request(app.clone(), Method::GET, "/cache/stats", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-        let auth = [(header::AUTHORIZATION.as_str(), "Bearer secret")];
+        let auth = header_map(&[(header::AUTHORIZATION.as_str(), "Bearer secret")]);
         let (status, _, body) =
-            request_with_headers(app.clone(), Method::GET, "/cache/stats", None, &auth).await;
+            request_with_headers(app.clone(), Method::GET, "/cache/stats", None, auth.clone())
+                .await;
         assert_eq!(status, StatusCode::OK);
         let stats: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(stats["entries"], 1);
@@ -2043,16 +3326,64 @@ printf '%s\n' "${{prefix}}fake.mp4"
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (status, _, body) =
-            request_with_headers(app.clone(), Method::DELETE, "/cache", None, &auth).await;
+            request_with_headers(app.clone(), Method::DELETE, "/cache", None, auth.clone()).await;
         assert_eq!(status, StatusCode::OK);
         let cleared: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(cleared["cleared"], 1);
 
         let (status, _, body) =
-            request_with_headers(app, Method::GET, "/cache/stats", None, &auth).await;
+            request_with_headers(app, Method::GET, "/cache/stats", None, auth).await;
         assert_eq!(status, StatusCode::OK);
         let stats: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(stats["entries"], 0);
         assert_eq!(harness.runs(), 1);
+    }
+
+    #[tokio::test]
+    async fn stored_cookies_partition_the_cache() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        stdfs::create_dir(&dir).unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(&cache_dir, None, Some(1024 * 1024));
+        let app = app(harness.config_full(
+            Duration::from_secs(30),
+            None,
+            Some(dir.clone()),
+            Some(cache),
+            None,
+            MAX_CONCURRENT,
+            MAX_FILESIZE,
+        ));
+
+        stdfs::write(
+            dir.join("youtube.txt"),
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tone\n",
+        )
+        .unwrap();
+        let payload = serde_json::json!({ "url": "https://youtu.be/stored" }).to_string();
+        let (status, _, _) = request(
+            app.clone(),
+            Method::POST,
+            "/download",
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(harness.runs(), 1);
+
+        stdfs::write(
+            dir.join("youtube.txt"),
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\ttwo\n",
+        )
+        .unwrap();
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            harness.runs(),
+            2,
+            "changed stored cookies must not reuse the cache entry"
+        );
     }
 }
