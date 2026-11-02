@@ -4,7 +4,7 @@
 //!       -> target/ixian.shortcut, asks server/id/secret on import
 //!   cargo run --bin build-shortcut -- --server URL --id ID --secret S --out x.shortcut
 //!       -> values baked in, no import questions
-//!   add --test to output the video instead of showing the menu
+//!   add --test to skip the menus (best quality) and output the video
 //!       (for `shortcuts run NAME -i in.txt -o out.mp4`)
 use serde_json::{json, Map, Value};
 use std::{
@@ -17,9 +17,10 @@ const DEFAULT_SERVER: &str = "https://ixian.astrapolaris.studio";
 const IS: u8 = 4;
 const HAS_NO_VALUE: u8 = 101;
 
-/// A value the workflow can reference: the shortcut input or an earlier action's output.
+/// A value the workflow can reference: the shortcut input, a named variable, or an action output.
 enum Target {
     ExtensionInput,
+    Variable(String),
     Action { uuid: String, name: String },
 }
 
@@ -27,6 +28,7 @@ impl Target {
     fn out(&self) -> Value {
         match self {
             Target::ExtensionInput => json!({ "Type": "ExtensionInput" }),
+            Target::Variable(name) => json!({ "Type": "Variable", "VariableName": name }),
             Target::Action { uuid, name } => json!({
                 "OutputUUID": uuid,
                 "OutputName": name,
@@ -155,6 +157,39 @@ impl Shortcut {
         params.insert("WFAlertActionMessage".into(), message);
         params.insert("WFAlertActionCancelButtonShown".into(), Value::Bool(false));
         self.action("alert", params);
+    }
+
+    fn variable(&mut self, name: &str, value: &str) {
+        let mut params = Map::new();
+        params.insert("WFVariableName".into(), Value::String(name.into()));
+        params.insert("WFInput".into(), text_token(&[Token::Text(value)]));
+        self.action("setvariable", params);
+    }
+
+    fn menu_start(&mut self, prompt: &str, items: &[&str]) -> String {
+        let group = self.next_uuid();
+        let mut params = Map::new();
+        params.insert("GroupingIdentifier".into(), Value::String(group.clone()));
+        params.insert("WFControlFlowMode".into(), json!(0));
+        params.insert("WFMenuPrompt".into(), json!(prompt));
+        params.insert("WFMenuItems".into(), json!(items));
+        self.action("choosefrommenu", params);
+        group
+    }
+
+    fn menu_case(&mut self, group: &str, title: &str) {
+        let mut params = Map::new();
+        params.insert("GroupingIdentifier".into(), Value::String(group.into()));
+        params.insert("WFControlFlowMode".into(), json!(1));
+        params.insert("WFMenuItemTitle".into(), json!(title));
+        self.action("choosefrommenu", params);
+    }
+
+    fn menu_end(&mut self, group: &str) {
+        let mut params = Map::new();
+        params.insert("GroupingIdentifier".into(), Value::String(group.into()));
+        params.insert("WFControlFlowMode".into(), json!(2));
+        self.action("choosefrommenu", params);
     }
 }
 
@@ -287,6 +322,26 @@ fn run_builder() -> Result<(), String> {
     params.insert("WFItemSpecifier".into(), json!("First Item"));
     let link = sc.action_named("getitemfromlist", params, "Item from List");
 
+    let mode_var = Target::Variable("mode".into());
+    let quality_var = Target::Variable("quality".into());
+    if args.test {
+        sc.variable("mode", "video");
+        sc.variable("quality", "best");
+    } else {
+        let group = sc.menu_start("ixian", &["Best", "720p", "Audio", "Data saver"]);
+        for (title, mode, quality) in [
+            ("Best", "video", "best"),
+            ("720p", "video", "720"),
+            ("Audio", "audio", "best"),
+            ("Data saver", "video", "data"),
+        ] {
+            sc.menu_case(&group, title);
+            sc.variable("mode", mode);
+            sc.variable("quality", quality);
+        }
+        sc.menu_end(&group);
+    }
+
     let mut params = Map::new();
     params.insert(
         "WFURL".into(),
@@ -305,7 +360,11 @@ fn run_builder() -> Result<(), String> {
     params.insert("WFHTTPBodyType".into(), json!("JSON"));
     params.insert(
         "WFJSONValues".into(),
-        dictionary(&[("url", Token::Ref(&link))]),
+        dictionary(&[
+            ("url", Token::Ref(&link)),
+            ("mode", Token::Ref(&mode_var)),
+            ("quality", Token::Ref(&quality_var)),
+        ]),
     );
     let video = sc.action_named("downloadurl", params, "Contents of URL");
 
@@ -331,7 +390,35 @@ fn run_builder() -> Result<(), String> {
     params.insert("WFInput".into(), video.attachment());
     params.insert("WFDictionaryKey".into(), json!("error"));
     let error = sc.action_named("getvalueforkey", params, "Dictionary Value");
+
+    let mut params = Map::new();
+    params.insert("WFInput".into(), video.attachment());
+    params.insert("WFDictionaryKey".into(), json!("hint"));
+    let hint = sc.action_named("getvalueforkey", params, "Dictionary Value");
+
+    let group = sc.next_uuid();
+    sc.action(
+        "conditional",
+        conditional(
+            &group,
+            0,
+            json!({
+                "WFInput": { "Type": "Variable", "Variable": hint.attachment() },
+                "WFCondition": HAS_NO_VALUE,
+            }),
+        ),
+    );
     sc.alert("ixian failed", text_token(&[Token::Ref(&error)]));
+    sc.action_named(
+        "conditional",
+        conditional(&group, 1, json!({})),
+        "Otherwise",
+    );
+    sc.alert(
+        "ixian failed",
+        text_token(&[Token::Ref(&error), Token::Text("\n"), Token::Ref(&hint)]),
+    );
+    sc.action_named("conditional", conditional(&group, 2, json!({})), "End If");
     sc.action("exit", Map::new());
     sc.action_named(
         "conditional",
@@ -370,26 +457,14 @@ fn run_builder() -> Result<(), String> {
         params.insert("WFVariable".into(), video.attachment());
         sc.action("getvariable", params);
     } else {
-        let items = ["Save to Photos", "Share", "Save to Files"];
-        let group = sc.next_uuid();
-        let mut params = Map::new();
-        params.insert("GroupingIdentifier".into(), Value::String(group.clone()));
-        params.insert("WFControlFlowMode".into(), json!(0));
-        params.insert("WFMenuPrompt".into(), json!("ixian"));
-        params.insert("WFMenuItems".into(), json!(items));
-        sc.action("choosefrommenu", params);
-
+        let group = sc.menu_start("ixian", &["Save to Photos", "Share", "Save to Files"]);
         let cases = [
             ("Save to Photos", "savetocameraroll"),
             ("Share", "share"),
             ("Save to Files", "documentpicker.save"),
         ];
         for (title, action_id) in cases {
-            let mut params = Map::new();
-            params.insert("GroupingIdentifier".into(), Value::String(group.clone()));
-            params.insert("WFControlFlowMode".into(), json!(1));
-            params.insert("WFMenuItemTitle".into(), json!(title));
-            sc.action("choosefrommenu", params);
+            sc.menu_case(&group, title);
 
             let mut params = Map::new();
             params.insert("WFInput".into(), video.attachment());
@@ -398,11 +473,7 @@ fn run_builder() -> Result<(), String> {
             }
             sc.action(action_id, params);
         }
-
-        let mut params = Map::new();
-        params.insert("GroupingIdentifier".into(), Value::String(group.clone()));
-        params.insert("WFControlFlowMode".into(), json!(2));
-        sc.action("choosefrommenu", params);
+        sc.menu_end(&group);
     }
 
     let question_count = sc.questions.len();
