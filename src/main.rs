@@ -10,7 +10,8 @@ use axum::{
 use serde_json::{json, Map, Value};
 use std::{
     collections::HashMap,
-    env, io,
+    env,
+    io::{self, Write},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -23,6 +24,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, ReadBuf},
     net::TcpListener,
     process::Command,
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 use tokio_util::io::ReaderStream;
@@ -32,7 +34,19 @@ use uuid::Uuid;
 const DEFAULT_FORMAT: &str = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4]/bv*+ba/b";
 const COOKIE_HINT: &str =
     "cookies may be invalid or incomplete; public posts download without cookies";
+const GET_COOKIE_HINT: &str = "send cookies in a POST /download JSON body instead";
+const GET_COOKIE_PARAMS: [&str; 3] = ["youtube_cookies", "x_cookies", "instagram_cookies"];
 const STREAM_CHUNK: usize = 64 * 1024;
+const MAX_CONCURRENT: usize = 4;
+const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+const MAX_COOKIE_BYTES: usize = 256 * 1024;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+const MAX_FILESIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const SOCKET_TIMEOUT_SECS: u64 = 10;
+const RETRIES: u64 = 3;
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const KILL_TIMEOUT: Duration = Duration::from_secs(2);
 const FILENAME_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
@@ -91,6 +105,8 @@ struct Config {
     format: String,
     timeout: Duration,
     tmp: PathBuf,
+    downloads: Arc<Semaphore>,
+    max_filesize: u64,
 }
 
 impl Config {
@@ -110,7 +126,8 @@ impl Config {
         let timeout_ms = env::var("YTDLP_TIMEOUT_MS")
             .ok()
             .and_then(|v| parse_ms(&v))
-            .unwrap_or_else(|| Duration::from_millis(600_000));
+            .unwrap_or_else(|| Duration::from_millis(MAX_TIMEOUT_MS))
+            .min(Duration::from_millis(MAX_TIMEOUT_MS));
         let tmp = non_empty(env::var("TMPDIR").ok())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -123,6 +140,8 @@ impl Config {
             format,
             timeout: timeout_ms,
             tmp,
+            downloads: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            max_filesize: MAX_FILESIZE,
         }
     }
 }
@@ -151,6 +170,22 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
+    fn bad_request_with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    fn too_large(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, message)
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, message)
+    }
+
     fn bad_gateway(message: impl Into<String>, hint: Option<&str>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -177,32 +212,56 @@ impl IntoResponse for ApiError {
 
 type ApiResult = Result<Response, ApiError>;
 
-fn resolve_platform(url: &str, requested: Option<&str>) -> Result<Platform, ApiError> {
-    if let Some(requested) = requested.filter(|name| !name.is_empty()) {
-        return Platform::from_name(requested).ok_or_else(|| {
+/// Parses and validates a request URL, returning the cleaned URL (stray
+/// backslashes removed) and the platform it belongs to. A `platform` override
+/// still has to match the URL host: it never widens the allowlist.
+fn validate_url(raw_url: &str, requested: Option<&str>) -> Result<(String, Platform), ApiError> {
+    let platform = match requested.filter(|name| !name.is_empty()) {
+        Some(requested) => Platform::from_name(requested).ok_or_else(|| {
             ApiError::bad_request(format!(
                 "unknown platform '{requested}' (expected: youtube, x, instagram)"
             ))
-        });
+        })?,
+        None => detect_platform(raw_url).ok_or_else(|| {
+            ApiError::bad_request(
+                "cannot detect platform (supported: youtube, x, instagram); pass 'platform' to override",
+            )
+        })?,
+    };
+
+    let cleaned = raw_url.replace('\\', "");
+    let url = Url::parse(&cleaned)
+        .map_err(|_| ApiError::bad_request("invalid url (expected an absolute http(s) URL)"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ApiError::bad_request("url must use http or https"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::bad_request("url has no host"))?;
+    if !host_allowed(platform, host) {
+        return Err(ApiError::bad_request(format!(
+            "url host '{host}' is not allowed for platform '{}'",
+            platform.name()
+        )));
     }
 
-    detect_platform(url).ok_or_else(|| {
-        ApiError::bad_request(
-            "cannot detect platform (supported: youtube, x, instagram); pass 'platform' to override",
-        )
-    })
+    Ok((cleaned, platform))
 }
 
 fn detect_platform(raw_url: &str) -> Option<Platform> {
-    let url = Url::parse(raw_url).ok()?;
+    let url = Url::parse(&raw_url.replace('\\', "")).ok()?;
     let host = url.host_str()?;
+    Platform::ALL
+        .into_iter()
+        .find(|platform| host_allowed(*platform, host))
+}
+
+fn host_allowed(platform: Platform, host: &str) -> bool {
     let host = host.strip_prefix("www.").unwrap_or(host);
-    Platform::ALL.into_iter().find(|platform| {
-        platform
-            .hosts()
-            .iter()
-            .any(|candidate| host == *candidate || host.ends_with(&format!(".{candidate}")))
-    })
+    platform
+        .hosts()
+        .iter()
+        .any(|candidate| host == *candidate || host.ends_with(&format!(".{candidate}")))
 }
 
 /// Netscape cookie file from either a Netscape file (passed through) or a raw `Cookie:` header string.
@@ -270,6 +329,36 @@ fn parse_ms_value(value: Option<&Value>) -> Option<Duration> {
     }
 }
 
+/// `timeout_ms` is canonical; `timeoutMs` is accepted as an alias.
+fn checked_timeout(duration: Duration) -> Result<Duration, ApiError> {
+    if duration.as_millis() > u128::from(MAX_TIMEOUT_MS) {
+        return Err(ApiError::bad_request(format!(
+            "'timeout_ms' must be at most {MAX_TIMEOUT_MS} milliseconds"
+        )));
+    }
+    Ok(duration)
+}
+
+fn query_timeout(params: &HashMap<String, String>) -> Result<Option<Duration>, ApiError> {
+    let Some(value) = params.get("timeout_ms").or_else(|| params.get("timeoutMs")) else {
+        return Ok(None);
+    };
+    let duration = parse_ms(value).ok_or_else(|| {
+        ApiError::bad_request("'timeout_ms' must be a positive number of milliseconds")
+    })?;
+    checked_timeout(duration).map(Some)
+}
+
+fn json_timeout(object: &Map<String, Value>) -> Result<Option<Duration>, ApiError> {
+    let Some(value) = object.get("timeout_ms").or_else(|| object.get("timeoutMs")) else {
+        return Ok(None);
+    };
+    let duration = parse_ms_value(Some(value)).ok_or_else(|| {
+        ApiError::bad_request("'timeout_ms' must be a positive number of milliseconds")
+    })?;
+    checked_timeout(duration).map(Some)
+}
+
 /// Removes stray backslashes (e.g. from copy-pasted urls like `\?utm_source\=x`) while keeping valid JSON escapes.
 fn sanitize_json_escapes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -301,6 +390,105 @@ struct DownloadRequest {
     timeout: Option<Duration>,
 }
 
+/// Creates the per-download directory with `0700` from the first syscall.
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Creates the cookie jar with `0600` atomically (`create_new`), so it is never
+/// readable by other users, not even for an instant.
+fn write_cookie_jar(path: &Path, contents: &str) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+/// Kills the whole process group led by `pid` (yt-dlp and its ffmpeg children).
+#[cfg(unix)]
+fn signal_process_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: a negative pid signals the process group led by `pid`.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_pid: u32) {}
+
+/// Kills the child's process group if the download future is dropped (client
+/// disconnect) or if it was not disarmed after a normal exit.
+struct ProcessGroup {
+    pid: u32,
+    armed: bool,
+}
+
+impl ProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pid: pid.unwrap_or(0),
+            armed: pid.is_some_and(|pid| pid > 0),
+        }
+    }
+
+    fn kill(&self) {
+        if self.armed {
+            signal_process_group(self.pid);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Keeps lossy UTF-8 conversion from growing past the byte cap.
+fn truncate_to_bytes(mut text: String, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        let mut end = max_bytes;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// Waits for a pipe reader, but never longer than [`PIPE_DRAIN_TIMEOUT`] after
+/// the child exited: a grandchild can keep the pipe open indefinitely.
+async fn drain_pipe(handle: tokio::task::JoinHandle<io::Result<String>>) -> (Option<String>, bool) {
+    let mut handle = handle;
+    tokio::select! {
+        joined = &mut handle => match joined {
+            Ok(Ok(text)) => (Some(text), false),
+            Ok(Err(_)) | Err(_) => (None, false),
+        },
+        _ = tokio::time::sleep(PIPE_DRAIN_TIMEOUT) => {
+            handle.abort();
+            (None, true)
+        }
+    }
+}
+
 /// Removes the per-download temp directory (media, cookie jar, yt-dlp fragments).
 struct Cleanup {
     dir: PathBuf,
@@ -322,6 +510,7 @@ impl Drop for Cleanup {
 struct TempFileReader {
     file: fs::File,
     _cleanup: Cleanup,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl AsyncRead for TempFileReader {
@@ -343,26 +532,37 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         format,
         timeout: request_timeout,
     } = request;
-    let url = url.replace('\\', "");
-    let has_cookies = cookies.as_deref().is_some_and(|c| !c.is_empty());
+    let cookies = cookies.filter(|cookies| !cookies.is_empty());
+    let has_cookies = cookies.is_some();
     let hint = has_cookies.then_some(COOKIE_HINT);
+    if cookies
+        .as_deref()
+        .is_some_and(|cookies| cookies.len() > MAX_COOKIE_BYTES)
+    {
+        return Err(ApiError::too_large(format!(
+            "cookies exceed the {MAX_COOKIE_BYTES} byte limit"
+        )));
+    }
+    let permit = config.downloads.clone().try_acquire_owned().map_err(|_| {
+        ApiError::too_many_requests(format!(
+            "too many concurrent downloads (limit: {MAX_CONCURRENT})"
+        ))
+    })?;
 
     let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
-    fs::create_dir(&dir)
-        .await
+    create_private_dir(&dir)
         .map_err(|error| ApiError::internal(format!("cannot create temp directory: {error}")))?;
     let jar = dir.join("cookies.txt");
     let cleanup = Cleanup::new(dir.clone());
-    if has_cookies {
-        let contents = cookie_file(cookies.as_deref().unwrap_or_default(), platform);
-        fs::write(&jar, contents)
-            .await
-            .map_err(|error| ApiError::internal(format!("cannot write cookie jar: {error}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&jar, std::fs::Permissions::from_mode(0o600)).await;
+    if let Some(cookies) = cookies.as_deref() {
+        let contents = cookie_file(cookies, platform);
+        if contents.len() > MAX_COOKIE_BYTES {
+            return Err(ApiError::too_large(format!(
+                "cookies exceed the {MAX_COOKIE_BYTES} byte limit"
+            )));
         }
+        write_cookie_jar(&jar, &contents)
+            .map_err(|error| ApiError::internal(format!("cannot write cookie jar: {error}")))?;
     }
 
     let mut cmd = Command::new(&config.ytdlp);
@@ -377,6 +577,12 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         .arg("after_move:filepath")
         .arg("--merge-output-format")
         .arg("mp4")
+        .arg("--socket-timeout")
+        .arg(SOCKET_TIMEOUT_SECS.to_string())
+        .arg("--retries")
+        .arg(RETRIES.to_string())
+        .arg("--max-filesize")
+        .arg(config.max_filesize.to_string())
         .arg("-f")
         .arg(format.as_deref().unwrap_or(&config.format))
         .arg("-o")
@@ -384,6 +590,8 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
     if let Some(plugin_dir) = &config.plugin_dir {
         cmd.arg("--plugin-dirs").arg(plugin_dir);
     }
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -391,17 +599,19 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
     if has_cookies {
         cmd.arg("--cookies").arg(&jar);
     }
-    cmd.arg(&url);
+    // `--` terminates option parsing so a leading dash can never become a flag.
+    cmd.arg("--").arg(&url);
 
     let mut child = cmd
         .spawn()
         .map_err(|error| ApiError::bad_gateway(format!("failed to run yt-dlp: {error}"), None))?;
+    let mut group = ProcessGroup::new(child.id());
 
     let mut stdout_pipe = child
         .stdout
         .take()
         .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stdout"))?;
-    let mut stderr_pipe = child
+    let stderr_pipe = child
         .stderr
         .take()
         .ok_or_else(|| ApiError::internal("cannot capture yt-dlp stderr"))?;
@@ -410,22 +620,29 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         stdout_pipe.read_to_string(&mut text).await.map(|_| text)
     });
     let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        stderr_pipe.read_to_string(&mut text).await.map(|_| text)
+        let mut buf = Vec::new();
+        let mut limited = stderr_pipe.take(MAX_STDERR_BYTES as u64);
+        limited.read_to_end(&mut buf).await.map(|_| {
+            let text = String::from_utf8_lossy(&buf);
+            truncate_to_bytes(text.trim_end().to_string(), MAX_STDERR_BYTES)
+        })
     });
 
     let limit = request_timeout.unwrap_or(config.timeout);
     let status = match timeout(limit, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
+            group.kill();
             return Err(ApiError::bad_gateway(
                 format!("failed to wait for yt-dlp: {error}"),
                 hint,
             ));
         }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            group.kill();
+            if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
+                group.disarm();
+            }
             // Do not wait on the pipes: yt-dlp's children (ffmpeg, curl) can keep them open.
             stdout_task.abort();
             stderr_task.abort();
@@ -436,16 +653,15 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         }
     };
 
-    let stdout = stdout_task
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    let stderr = stderr_task
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    // yt-dlp exited, but a grandchild may still hold the pipes open.
+    let ((stdout, stdout_stalled), (stderr, stderr_stalled)) =
+        tokio::join!(drain_pipe(stdout_task), drain_pipe(stderr_task));
+    if stdout_stalled || stderr_stalled {
+        group.kill();
+    }
+    group.disarm();
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
 
     let path = primary_filepath(&stdout);
     let media = match path {
@@ -469,6 +685,16 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
     if !metadata.is_file() {
         return Err(ApiError::bad_gateway(
             "yt-dlp did not produce an output file",
+            hint,
+        ));
+    }
+    if metadata.len() > config.max_filesize {
+        return Err(ApiError::bad_gateway(
+            format!(
+                "output file is {} bytes, over the {} byte limit",
+                metadata.len(),
+                config.max_filesize
+            ),
             hint,
         ));
     }
@@ -509,6 +735,7 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
     let reader = TempFileReader {
         file,
         _cleanup: cleanup,
+        _permit: permit,
     };
     let body = Body::from_stream(ReaderStream::with_capacity(reader, STREAM_CHUNK));
     let mut response = Response::new(body);
@@ -528,24 +755,35 @@ async fn download_get(State(config): State<Arc<Config>>, uri: Uri) -> ApiResult 
         url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .into_owned()
             .collect();
+    if let Some((name, _)) = params
+        .iter()
+        .find(|(name, _)| GET_COOKIE_PARAMS.contains(&name.as_str()))
+    {
+        return Err(ApiError::bad_request_with_hint(
+            format!("'{name}' is not accepted in GET query strings"),
+            GET_COOKIE_HINT,
+        ));
+    }
+
     let url = params
         .get("url")
         .map(String::as_str)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| ApiError::bad_request("missing 'url' query parameter"))?;
-    let platform = resolve_platform(url, params.get("platform").map(String::as_str))?;
+    let (url, platform) = validate_url(url, params.get("platform").map(String::as_str))?;
+    let timeout = query_timeout(&params)?;
 
     download(
         &config,
         DownloadRequest {
-            url: url.to_string(),
+            url,
             platform,
-            cookies: params.get(&format!("{}_cookies", platform.name())).cloned(),
+            cookies: None,
             format: params
                 .get("format")
                 .filter(|format| !format.is_empty())
                 .cloned(),
-            timeout: params.get("timeout_ms").and_then(|value| parse_ms(value)),
+            timeout,
         },
     )
     .await
@@ -567,7 +805,8 @@ async fn download_post(State(config): State<Arc<Config>>, body: String) -> ApiRe
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| ApiError::bad_request("missing 'url' in JSON body"))?;
-    let platform = resolve_platform(url, object.get("platform").and_then(Value::as_str))?;
+    let (url, platform) = validate_url(url, object.get("platform").and_then(Value::as_str))?;
+    let timeout = json_timeout(object)?;
 
     let cookies = object
         .get("cookies")
@@ -584,7 +823,7 @@ async fn download_post(State(config): State<Arc<Config>>, body: String) -> ApiRe
     download(
         &config,
         DownloadRequest {
-            url: url.to_string(),
+            url,
             platform,
             cookies,
             format: object
@@ -592,7 +831,7 @@ async fn download_post(State(config): State<Arc<Config>>, body: String) -> ApiRe
                 .and_then(Value::as_str)
                 .filter(|format| !format.is_empty())
                 .map(str::to_string),
-            timeout: parse_ms_value(object.get("timeoutMs")),
+            timeout,
         },
     )
     .await
@@ -612,7 +851,7 @@ fn app(config: Arc<Config>) -> Router {
         .route("/download", get(download_get).post(download_post))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(config)
 }
 
@@ -665,17 +904,53 @@ mod tests {
     }
 
     #[test]
-    fn platform_override_wins_and_validates() {
+    fn platform_override_still_enforces_the_host_allowlist() {
         assert_eq!(
-            resolve_platform("https://example.com/v", Some("instagram")).unwrap(),
+            validate_url("https://www.instagram.com/reel/abc/", Some("instagram"))
+                .unwrap()
+                .1,
             Platform::Instagram
         );
-        assert!(resolve_platform("https://example.com/v", Some("tiktok")).is_err());
         assert_eq!(
-            resolve_platform("https://example.com/v", Some(""))
+            validate_url("http://127.0.0.1/video", Some("youtube"))
                 .unwrap_err()
                 .status,
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_url("https://x.com/user/status/1", Some("youtube"))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(validate_url("https://example.com/v", Some("tiktok")).is_err());
+        assert_eq!(
+            validate_url("https://example.com/v", Some(""))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_urls_and_cleans_backslashes() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://youtu.be/abc",
+            "javascript:alert(1)",
+            "--exec=rm -rf /",
+        ] {
+            assert_eq!(
+                validate_url(url, Some("youtube")).unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+                "{url}"
+            );
+        }
+        assert_eq!(
+            validate_url(r"https://www.youtube.com/watch\?v\=abc", None)
+                .unwrap()
+                .0,
+            "https://www.youtube.com/watch?v=abc"
         );
     }
 
@@ -727,6 +1002,49 @@ mod tests {
         assert_eq!(parse_ms("0"), None);
         assert_eq!(parse_ms("-5"), None);
         assert_eq!(parse_ms("nope"), None);
+    }
+
+    #[test]
+    fn creates_temp_dir_0700_and_cookie_jar_0600_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let dir = parent.path().join("ixian-test");
+        create_private_dir(&dir).unwrap();
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        let jar = dir.join("cookies.txt");
+        write_cookie_jar(&jar, "cookie data").unwrap();
+        let jar_mode = std::fs::metadata(&jar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(jar_mode, 0o600);
+        // `create_new` refuses to reuse an existing file.
+        assert!(write_cookie_jar(&jar, "other").is_err());
+        assert_eq!(std::fs::read_to_string(&jar).unwrap(), "cookie data");
+    }
+
+    #[test]
+    fn caps_timeouts() {
+        assert_eq!(
+            checked_timeout(Duration::from_millis(MAX_TIMEOUT_MS)).unwrap(),
+            Duration::from_millis(MAX_TIMEOUT_MS)
+        );
+        assert!(checked_timeout(Duration::from_millis(MAX_TIMEOUT_MS + 1)).is_err());
+
+        let params = HashMap::from([("timeoutMs".to_string(), "1500".to_string())]);
+        assert_eq!(
+            query_timeout(&params).unwrap(),
+            Some(Duration::from_millis(1500))
+        );
+        let params = HashMap::from([("timeout_ms".to_string(), "nope".to_string())]);
+        assert!(query_timeout(&params).is_err());
+    }
+
+    #[test]
+    fn truncates_stderr_on_a_char_boundary() {
+        assert_eq!(truncate_to_bytes("abcdef".into(), 3), "abc");
+        assert_eq!(truncate_to_bytes("é".into(), 1), "");
+        assert_eq!(truncate_to_bytes("ok".into(), 10), "ok");
     }
 
     #[test]
@@ -787,6 +1105,9 @@ printf '%s\n' "$@" > "$LOG/args.txt"
 if [ -n "$jar" ]; then cp -p "$jar" "$LOG/jar.txt"; fi
 {extra}
 prefix="${{out%%\%*}}"
+dir="${{prefix%/}}"
+mode=$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir")
+printf '%s\n' "$mode" > "$LOG/dirmode.txt"
 printf 'partial' > "${{prefix}}partial.part"
 printf 'fake video data' > "${{prefix}}fake.mp4"
 printf '%s\n' "${{prefix}}fake.mp4"
@@ -807,6 +1128,16 @@ printf '%s\n' "${{prefix}}fake.mp4"
             timeout: Duration,
             plugin_dir: Option<PathBuf>,
         ) -> Arc<Config> {
+            self.config_with_limits(plugin_dir, timeout, MAX_CONCURRENT, MAX_FILESIZE)
+        }
+
+        fn config_with_limits(
+            &self,
+            plugin_dir: Option<PathBuf>,
+            timeout: Duration,
+            concurrency: usize,
+            max_filesize: u64,
+        ) -> Arc<Config> {
             Arc::new(Config {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -815,8 +1146,48 @@ printf '%s\n' "${{prefix}}fake.mp4"
                 format: DEFAULT_FORMAT.into(),
                 timeout,
                 tmp: self.tmp.path().to_path_buf(),
+                downloads: Arc::new(Semaphore::new(concurrency)),
+                max_filesize,
             })
         }
+    }
+
+    fn query(params: &[(&str, &str)]) -> String {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in params {
+            serializer.append_pair(name, value);
+        }
+        format!("/download?{}", serializer.finish())
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    async fn assert_process_dies(pid: u32) {
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("process {pid} survived");
+    }
+
+    async fn wait_for_file(path: &Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} was not created", path.display());
     }
 
     async fn request(
@@ -862,6 +1233,8 @@ printf '%s\n' "${{prefix}}fake.mp4"
         );
         assert!(!disposition.contains("ixian-"), "{disposition}");
         assert_eq!(body, b"fake video data");
+        let dir_mode = stdfs::read_to_string(harness.logs.path().join("dirmode.txt")).unwrap();
+        assert_eq!(dir_mode.trim(), "700");
         tokio::task::yield_now().await;
         assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
     }
@@ -1014,5 +1387,277 @@ printf '%s\n' "${{prefix}}fake.mp4"
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "method not allowed");
+    }
+
+    #[tokio::test]
+    async fn passes_hardening_flags_and_double_dash() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload =
+            serde_json::json!({ "url": "https://www.youtube.com/watch?v=abc" }).to_string();
+
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert_eq!(lines[lines.len() - 2], "--");
+        assert_eq!(
+            lines[lines.len() - 1],
+            "https://www.youtube.com/watch?v=abc"
+        );
+        let value_of = |flag: &str| {
+            let index = lines.iter().position(|arg| *arg == flag).unwrap();
+            lines[index + 1]
+        };
+        assert_eq!(
+            value_of("--socket-timeout"),
+            SOCKET_TIMEOUT_SECS.to_string()
+        );
+        assert_eq!(value_of("--retries"), RETRIES.to_string());
+        assert_eq!(value_of("--max-filesize"), MAX_FILESIZE.to_string());
+    }
+
+    #[tokio::test]
+    async fn rejects_cookies_on_get() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let uri = query(&[
+            ("url", "https://x.com/user/status/1"),
+            ("x_cookies", "auth_token=secret"),
+        ]);
+
+        let (status, _, body) = request(app, Method::GET, &uri, None).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(error["hint"].as_str().unwrap().contains("POST"), "{error}");
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_urls_outside_the_platform_allowlist() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        let uri = query(&[("url", "http://127.0.0.1/video"), ("platform", "youtube")]);
+        let (status, _, body) = request(app.clone(), Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("not allowed"),
+            "{error}"
+        );
+
+        for (url, platform) in [
+            ("https://x.com/user/status/1", "youtube"),
+            ("file:///etc/passwd", "youtube"),
+            ("ftp://youtu.be/abc", "youtube"),
+            ("--exec=rm -rf /", "youtube"),
+        ] {
+            let payload = serde_json::json!({ "url": url, "platform": platform }).to_string();
+            let (status, _, _) =
+                request(app.clone(), Method::POST, "/download", Some(payload)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}");
+        }
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn accepts_both_timeout_names() {
+        let harness = Harness::new("sleep 5");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        for name in ["timeout_ms", "timeoutMs"] {
+            let uri = query(&[("url", "https://youtu.be/abc"), (name, "100")]);
+            let started = std::time::Instant::now();
+            let (status, _, _) = request(app.clone(), Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "GET {name}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        for name in ["timeout_ms", "timeoutMs"] {
+            let payload = if name == "timeout_ms" {
+                serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": 100 }).to_string()
+            } else {
+                serde_json::json!({ "url": "https://youtu.be/abc", "timeoutMs": 100 }).to_string()
+            };
+            let started = std::time::Instant::now();
+            let (status, _, _) =
+                request(app.clone(), Method::POST, "/download", Some(payload)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "POST {name}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_and_oversized_timeouts() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        for payload in [
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": "nope" }),
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeoutMs": 0 }),
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": MAX_TIMEOUT_MS + 1 }),
+        ] {
+            let (status, _, _) = request(
+                app.clone(),
+                Method::POST,
+                "/download",
+                Some(payload.to_string()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+        }
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_cookies() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({
+            "url": "https://x.com/user/status/1",
+            "cookies": { "x": "a".repeat(MAX_COOKIE_BYTES + 1) },
+        })
+        .to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("cookie"),
+            "{error}"
+        );
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounds_stderr_capture() {
+        let harness = Harness::new("yes x | head -c 100000 >&2; exit 1");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        let message = error["error"].as_str().unwrap();
+        assert!(!message.is_empty());
+        assert!(
+            message.len() <= MAX_STDERR_BYTES,
+            "stderr was {} bytes",
+            message.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_output_over_max_filesize() {
+        let harness = Harness::new("");
+        let app = app(harness.config_with_limits(None, Duration::from_secs(30), MAX_CONCURRENT, 4));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("limit"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_429_when_concurrency_is_exhausted() {
+        let harness = Harness::new("sleep 30");
+        let app = app(harness.config_with_limits(None, Duration::from_secs(60), 1, MAX_FILESIZE));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let first = tokio::spawn(request(
+            app.clone(),
+            Method::POST,
+            "/download",
+            Some(payload.clone()),
+        ));
+        wait_for_file(&harness.logs.path().join("args.txt")).await;
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("concurrent"),
+            "{error}"
+        );
+        first.abort();
+        let _ = first.await;
+    }
+
+    #[tokio::test]
+    async fn kills_process_group_on_timeout() {
+        let harness = Harness::new("sleep 30 & echo $! > \"$LOG/grandchild.pid\"; sleep 30");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload =
+            serde_json::json!({ "url": "https://youtu.be/abc", "timeout_ms": 1000 }).to_string();
+
+        let started = std::time::Instant::now();
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("timed out"),
+            "{error}"
+        );
+        let pid = stdfs::read_to_string(harness.logs.path().join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_dies(pid).await;
+    }
+
+    #[tokio::test]
+    async fn kills_process_group_when_request_is_cancelled() {
+        let harness = Harness::new("sleep 30 & echo $! > \"$LOG/grandchild.pid\"; sleep 30");
+        let app = app(harness.config(Duration::from_secs(60)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let task = tokio::spawn(request(app, Method::POST, "/download", Some(payload)));
+        wait_for_file(&harness.logs.path().join("grandchild.pid")).await;
+
+        task.abort();
+        let _ = task.await;
+
+        let pid = stdfs::read_to_string(harness.logs.path().join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_dies(pid).await;
+    }
+
+    #[tokio::test]
+    async fn bounds_post_exit_pipe_drain() {
+        let harness = Harness::new("sleep 30 1>/dev/null & echo $! > \"$LOG/grandchild.pid\"");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let started = std::time::Instant::now();
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(body, b"fake video data");
+        let pid = stdfs::read_to_string(harness.logs.path().join("grandchild.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_dies(pid).await;
     }
 }
