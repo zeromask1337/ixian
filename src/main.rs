@@ -1,10 +1,10 @@
-// ixian - minimal yt-dlp wrapper (youtube / x.com / instagram) in Rust.
+// ixian - minimal yt-dlp wrapper (youtube / x.com / instagram / tiktok) in Rust.
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as UrlPath, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, put},
     Json, Router,
 };
 use serde_json::{json, Map, Value};
@@ -16,11 +16,11 @@ use std::{
     process::Stdio,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::TcpListener,
     process::Command,
     time::timeout,
@@ -32,6 +32,9 @@ use uuid::Uuid;
 const DEFAULT_FORMAT: &str = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4]/bv*+ba/b";
 const COOKIE_HINT: &str =
     "cookies may be invalid or incomplete; public posts download without cookies";
+const COOKIE_DIR_MODE: u32 = 0o700;
+const COOKIE_FILE_MODE: u32 = 0o600;
+const MAX_STORED_COOKIE_BYTES: usize = 1024 * 1024;
 const STREAM_CHUNK: usize = 64 * 1024;
 const FILENAME_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
@@ -49,16 +52,23 @@ enum Platform {
     YouTube,
     X,
     Instagram,
+    TikTok,
 }
 
 impl Platform {
-    const ALL: [Platform; 3] = [Platform::YouTube, Platform::X, Platform::Instagram];
+    const ALL: [Platform; 4] = [
+        Platform::YouTube,
+        Platform::X,
+        Platform::Instagram,
+        Platform::TikTok,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Platform::YouTube => "youtube",
             Platform::X => "x",
             Platform::Instagram => "instagram",
+            Platform::TikTok => "tiktok",
         }
     }
 
@@ -67,6 +77,7 @@ impl Platform {
             Platform::YouTube => &["youtube.com", "youtu.be"],
             Platform::X => &["x.com", "twitter.com"],
             Platform::Instagram => &["instagram.com"],
+            Platform::TikTok => &["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"],
         }
     }
 
@@ -75,12 +86,30 @@ impl Platform {
             Platform::YouTube => &[".youtube.com"],
             Platform::X => &[".x.com", ".twitter.com"],
             Platform::Instagram => &[".instagram.com"],
+            Platform::TikTok => &[".tiktok.com"],
         }
     }
 
     fn from_name(name: &str) -> Option<Platform> {
         Platform::ALL.into_iter().find(|p| p.name() == name)
     }
+}
+
+fn supported_names() -> String {
+    Platform::ALL
+        .iter()
+        .map(|platform| platform.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_platform(name: &str) -> Result<Platform, ApiError> {
+    Platform::from_name(name).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "unknown platform '{name}' (expected: {})",
+            supported_names()
+        ))
+    })
 }
 
 struct Config {
@@ -91,6 +120,8 @@ struct Config {
     format: String,
     timeout: Duration,
     tmp: PathBuf,
+    cookie_dir: Option<PathBuf>,
+    token: Option<String>,
 }
 
 impl Config {
@@ -114,6 +145,11 @@ impl Config {
         let tmp = non_empty(env::var("TMPDIR").ok())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let cookie_dir = non_empty(env::var("IXIAN_COOKIE_DIR").ok()).map(PathBuf::from);
+        let token = env::var("IXIAN_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         Self {
             host,
@@ -123,6 +159,8 @@ impl Config {
             format,
             timeout: timeout_ms,
             tmp,
+            cookie_dir,
+            token,
         }
     }
 }
@@ -179,17 +217,14 @@ type ApiResult = Result<Response, ApiError>;
 
 fn resolve_platform(url: &str, requested: Option<&str>) -> Result<Platform, ApiError> {
     if let Some(requested) = requested.filter(|name| !name.is_empty()) {
-        return Platform::from_name(requested).ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "unknown platform '{requested}' (expected: youtube, x, instagram)"
-            ))
-        });
+        return parse_platform(requested);
     }
 
     detect_platform(url).ok_or_else(|| {
-        ApiError::bad_request(
-            "cannot detect platform (supported: youtube, x, instagram); pass 'platform' to override",
-        )
+        ApiError::bad_request(format!(
+            "cannot detect platform (supported: {}); pass 'platform' to override",
+            supported_names()
+        ))
     })
 }
 
@@ -207,7 +242,7 @@ fn detect_platform(raw_url: &str) -> Option<Platform> {
 
 /// Netscape cookie file from either a Netscape file (passed through) or a raw `Cookie:` header string.
 fn cookie_file(cookies: &str, platform: Platform) -> String {
-    if cookies.contains('\t') {
+    if is_netscape_cookie_file(cookies) {
         return cookies.to_string();
     }
 
@@ -236,10 +271,152 @@ fn cookie_file(cookies: &str, platform: Platform) -> String {
     lines.join("\n")
 }
 
+fn is_netscape_cookie_file(cookies: &str) -> bool {
+    cookies.contains('\t')
+}
+
 fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     let head = value.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix)
         .then(|| &value[prefix.len()..])
+}
+
+fn cookie_path(dir: &Path, platform: Platform) -> PathBuf {
+    dir.join(format!("{}.txt", platform.name()))
+}
+
+/// Normalizes a `PUT /cookies/{platform}` body (raw `Cookie:` header or Netscape file).
+fn stored_cookie_contents(input: &str, platform: Platform) -> Result<String, ApiError> {
+    if input.len() > MAX_STORED_COOKIE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("cookie file too large (max {MAX_STORED_COOKIE_BYTES} bytes)"),
+        ));
+    }
+    if input.trim().is_empty() {
+        return Err(ApiError::bad_request("empty cookie body"));
+    }
+
+    let input = input.trim_end_matches(['\r', '\n']);
+    if is_netscape_cookie_file(input) {
+        let has_entry = input.lines().any(|line| {
+            let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+            !line.trim_start().starts_with('#') && line.split('\t').count() >= 7
+        });
+        if !has_entry {
+            return Err(ApiError::bad_request(
+                "cookie file has no entries (expected a Netscape cookie file)",
+            ));
+        }
+        return Ok(format!("{input}\n"));
+    }
+
+    let file = cookie_file(input, platform);
+    if file.lines().count() <= 1 {
+        return Err(ApiError::bad_request(
+            "no cookies found (send a Cookie header or a Netscape cookie file)",
+        ));
+    }
+    Ok(file)
+}
+
+async fn stored_cookies(config: &Config, platform: Platform) -> Result<Option<String>, ApiError> {
+    let Some(dir) = &config.cookie_dir else {
+        return Ok(None);
+    };
+    match fs::read_to_string(cookie_path(dir, platform)).await {
+        Ok(contents) if !contents.trim().is_empty() => Ok(Some(contents)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ApiError::internal(format!(
+            "cannot read stored cookies for {}: {error}",
+            platform.name()
+        ))),
+    }
+}
+
+async fn ensure_cookie_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(COOKIE_DIR_MODE)).await?;
+    }
+    Ok(())
+}
+
+async fn write_cookie_file(path: &Path, contents: &str) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cookie path has no parent directory",
+        )
+    })?;
+    ensure_cookie_dir(dir).await?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cookies");
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let result = write_cookie_tmp(&tmp, path, contents).await;
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+async fn write_cookie_tmp(tmp: &Path, path: &Path, contents: &str) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(COOKIE_FILE_MODE);
+    let mut file = options.open(tmp).await?;
+    file.write_all(contents.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(tmp, std::fs::Permissions::from_mode(COOKIE_FILE_MODE)).await?;
+    }
+    fs::rename(tmp, path).await
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn authorize(config: &Config, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(token) = config.token.as_deref() else {
+        return Ok(());
+    };
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| strip_prefix_ignore_case(value.trim(), "bearer "))
+        .map(str::trim);
+    let authorized =
+        provided.is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()));
+    if authorized {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token (IXIAN_TOKEN)",
+        ))
+    }
+}
+
+fn system_time_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 /// yt-dlp prints one filepath per downloaded item. A tweet that quotes another
@@ -344,7 +521,13 @@ async fn download(config: &Config, request: DownloadRequest) -> ApiResult {
         timeout: request_timeout,
     } = request;
     let url = url.replace('\\', "");
-    let has_cookies = cookies.as_deref().is_some_and(|c| !c.is_empty());
+    let cookies = match cookies.filter(|cookies| !cookies.trim().is_empty()) {
+        Some(cookies) => Some(cookies),
+        None => stored_cookies(config, platform).await?,
+    };
+    let has_cookies = cookies
+        .as_deref()
+        .is_some_and(|cookies| !cookies.trim().is_empty());
     let hint = has_cookies.then_some(COOKIE_HINT);
 
     let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
@@ -598,6 +781,96 @@ async fn download_post(State(config): State<Arc<Config>>, body: String) -> ApiRe
     .await
 }
 
+fn cookie_store_dir(config: &Config) -> Result<&Path, ApiError> {
+    config
+        .cookie_dir
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("cookie store disabled; set IXIAN_COOKIE_DIR"))
+}
+
+async fn list_cookies(State(config): State<Arc<Config>>) -> Json<Value> {
+    let mut cookies = Vec::with_capacity(Platform::ALL.len());
+    for platform in Platform::ALL {
+        let metadata = match &config.cookie_dir {
+            Some(dir) => fs::metadata(cookie_path(dir, platform))
+                .await
+                .ok()
+                .filter(|metadata| metadata.is_file()),
+            None => None,
+        };
+        let mut entry = json!({
+            "platform": platform.name(),
+            "present": metadata.is_some(),
+        });
+        let mtime = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_secs);
+        if let Some(mtime) = mtime {
+            entry["mtime"] = json!(mtime);
+        }
+        cookies.push(entry);
+    }
+
+    Json(json!({
+        "enabled": config.cookie_dir.is_some(),
+        "cookies": cookies,
+    }))
+}
+
+async fn put_cookie(
+    State(config): State<Arc<Config>>,
+    UrlPath(platform): UrlPath<String>,
+    headers: HeaderMap,
+    body: String,
+) -> ApiResult {
+    authorize(&config, &headers)?;
+    let platform = parse_platform(&platform)?;
+    let dir = cookie_store_dir(&config)?;
+    let contents = stored_cookie_contents(&body, platform)?;
+    let path = cookie_path(dir, platform);
+    write_cookie_file(&path, &contents)
+        .await
+        .map_err(|error| ApiError::internal(format!("cannot store cookies: {error}")))?;
+    let mtime = fs::metadata(&path)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_secs);
+
+    Ok(Json(json!({
+        "platform": platform.name(),
+        "stored": true,
+        "mtime": mtime,
+    }))
+    .into_response())
+}
+
+async fn delete_cookie(
+    State(config): State<Arc<Config>>,
+    UrlPath(platform): UrlPath<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    authorize(&config, &headers)?;
+    let platform = parse_platform(&platform)?;
+    let dir = cookie_store_dir(&config)?;
+    let deleted = match fs::remove_file(cookie_path(dir, platform)).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "cannot delete stored cookies: {error}"
+            )));
+        }
+    };
+
+    Ok(Json(json!({
+        "platform": platform.name(),
+        "deleted": deleted,
+    }))
+    .into_response())
+}
+
 async fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not found")
 }
@@ -610,6 +883,8 @@ fn app(config: Arc<Config>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/download", get(download_get).post(download_post))
+        .route("/cookies", get(list_cookies))
+        .route("/cookies/{platform}", put(put_cookie).delete(delete_cookie))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
@@ -660,6 +935,14 @@ mod tests {
             detect_platform("https://www.instagram.com/reel/abc/"),
             Some(Platform::Instagram)
         );
+        for url in [
+            "https://www.tiktok.com/@user/video/123",
+            "https://tiktok.com/@user/video/123",
+            "https://vm.tiktok.com/ZMabc/",
+            "https://vt.tiktok.com/ZMabc/",
+        ] {
+            assert_eq!(detect_platform(url), Some(Platform::TikTok), "{url}");
+        }
         assert_eq!(detect_platform("https://example.com/video"), None);
         assert_eq!(detect_platform("not a url"), None);
     }
@@ -670,7 +953,11 @@ mod tests {
             resolve_platform("https://example.com/v", Some("instagram")).unwrap(),
             Platform::Instagram
         );
-        assert!(resolve_platform("https://example.com/v", Some("tiktok")).is_err());
+        assert_eq!(
+            resolve_platform("https://example.com/v", Some("tiktok")).unwrap(),
+            Platform::TikTok
+        );
+        assert!(resolve_platform("https://example.com/v", Some("vimeo")).is_err());
         assert_eq!(
             resolve_platform("https://example.com/v", Some(""))
                 .unwrap_err()
@@ -695,6 +982,40 @@ mod tests {
         let netscape =
             "# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tx\n";
         assert_eq!(cookie_file(netscape, Platform::Instagram), netscape);
+    }
+
+    #[test]
+    fn builds_tiktok_cookie_file_from_header() {
+        let file = cookie_file(
+            "Cookie: sessionid=abc; tt_chain_token=d=ef",
+            Platform::TikTok,
+        );
+        assert!(file.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\tabc"));
+        assert!(file.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\ttt_chain_token\td=ef"));
+        assert!(!file.contains(".instagram.com"));
+    }
+
+    #[test]
+    fn normalizes_cookie_store_inputs() {
+        let file = stored_cookie_contents("Cookie: sessionid=abc", Platform::TikTok).unwrap();
+        assert!(file.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\tabc"));
+
+        let netscape = "# Netscape HTTP Cookie File\n\
+                        #HttpOnly_.tiktok.com\tTRUE\t/\tTRUE\t0\tsessionid\tx\n";
+        assert_eq!(
+            stored_cookie_contents(netscape, Platform::TikTok).unwrap(),
+            netscape
+        );
+        assert_eq!(
+            stored_cookie_contents(netscape.trim_end(), Platform::TikTok).unwrap(),
+            netscape
+        );
+        assert!(stored_cookie_contents("  \n", Platform::TikTok).is_err());
+        assert!(stored_cookie_contents("# Netscape HTTP Cookie File\n", Platform::TikTok).is_err());
+        assert!(
+            stored_cookie_contents(&"a".repeat(MAX_STORED_COOKIE_BYTES + 1), Platform::TikTok)
+                .is_err()
+        );
     }
 
     #[test]
@@ -799,13 +1120,32 @@ printf '%s\n' "${{prefix}}fake.mp4"
         }
 
         fn config(&self, timeout: Duration) -> Arc<Config> {
-            self.config_with_plugin_dir(timeout, None)
+            self.config_full(timeout, None, None, None)
         }
 
         fn config_with_plugin_dir(
             &self,
             timeout: Duration,
             plugin_dir: Option<PathBuf>,
+        ) -> Arc<Config> {
+            self.config_full(timeout, plugin_dir, None, None)
+        }
+
+        fn config_with_cookie_store(
+            &self,
+            timeout: Duration,
+            cookie_dir: PathBuf,
+            token: Option<&str>,
+        ) -> Arc<Config> {
+            self.config_full(timeout, None, Some(cookie_dir), token.map(str::to_string))
+        }
+
+        fn config_full(
+            &self,
+            timeout: Duration,
+            plugin_dir: Option<PathBuf>,
+            cookie_dir: Option<PathBuf>,
+            token: Option<String>,
         ) -> Arc<Config> {
             Arc::new(Config {
                 host: "127.0.0.1".into(),
@@ -815,6 +1155,8 @@ printf '%s\n' "${{prefix}}fake.mp4"
                 format: DEFAULT_FORMAT.into(),
                 timeout,
                 tmp: self.tmp.path().to_path_buf(),
+                cookie_dir,
+                token,
             })
         }
     }
@@ -825,9 +1167,22 @@ printf '%s\n' "${{prefix}}fake.mp4"
         uri: &str,
         body: Option<String>,
     ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        request_with_headers(app, method, uri, body, HeaderMap::new()).await
+    }
+
+    async fn request_with_headers(
+        app: Router,
+        method: Method,
+        uri: &str,
+        body: Option<String>,
+        headers: HeaderMap,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
         let mut builder = Request::builder().method(method).uri(uri);
         if body.is_some() {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        for (name, value) in &headers {
+            builder = builder.header(name, value);
         }
         let request = builder.body(Body::from(body.unwrap_or_default())).unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -986,7 +1341,7 @@ printf '%s\n' "${{prefix}}fake.mp4"
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "missing 'url' query parameter");
 
-        let payload = r#"{"url":"https://example.com/video","platform":"tiktok"}"#.to_string();
+        let payload = r#"{"url":"https://example.com/video","platform":"vimeo"}"#.to_string();
         let (status, _, body) =
             request(app.clone(), Method::POST, "/download", Some(payload)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1014,5 +1369,235 @@ printf '%s\n' "${{prefix}}fake.mp4"
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "method not allowed");
+    }
+
+    #[tokio::test]
+    async fn downloads_tiktok_with_default_format() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://vm.tiktok.com/ZMabc/" }).to_string();
+
+        let (status, headers, _) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["x-ixian-platform"].to_str().unwrap(), "tiktok");
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        let index = lines.iter().position(|arg| *arg == "-f").unwrap();
+        assert_eq!(lines[index + 1], DEFAULT_FORMAT);
+    }
+
+    #[tokio::test]
+    async fn auto_loads_stored_cookies_and_request_cookies_win() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        stdfs::create_dir(&dir).unwrap();
+        stdfs::write(
+            dir.join("youtube.txt"),
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tfrom-file\n",
+        )
+        .unwrap();
+        let app = app(harness.config_with_cookie_store(Duration::from_secs(30), dir, None));
+
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let (status, _, _) = request(app.clone(), Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let jar = stdfs::read_to_string(harness.logs.path().join("jar.txt")).unwrap();
+        assert!(jar.contains("SID\tfrom-file"), "{jar}");
+
+        let payload = serde_json::json!({
+            "url": "https://youtu.be/abc",
+            "youtube_cookies": "SID=from-request",
+        })
+        .to_string();
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let jar = stdfs::read_to_string(harness.logs.path().join("jar.txt")).unwrap();
+        assert!(jar.contains("SID\tfrom-request"), "{jar}");
+        assert!(!jar.contains("from-file"), "{jar}");
+    }
+
+    #[tokio::test]
+    async fn stores_lists_and_deletes_cookies_without_returning_values() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        let app = app(harness.config_with_cookie_store(Duration::from_secs(30), dir.clone(), None));
+
+        let (status, _, _) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/tiktok",
+            Some("# Netscape HTTP Cookie File\n".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!dir.exists());
+
+        let (status, _, body) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/tiktok",
+            Some("Cookie: sessionid=secret-value; tt_chain_token=chain".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let stored: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stored["platform"], "tiktok");
+        assert_eq!(stored["stored"], true);
+        assert!(stored["mtime"].is_u64());
+
+        let file = dir.join("tiktok.txt");
+        let contents = stdfs::read_to_string(&file).unwrap();
+        assert!(
+            contents.contains(".tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\tsecret-value")
+        );
+        assert_eq!(
+            stdfs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            stdfs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(stdfs::read_dir(&dir).unwrap().count(), 1);
+
+        let (status, _, body) = request(app.clone(), Method::GET, "/cookies", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(!text.contains("secret-value"), "{text}");
+        assert!(!text.contains("chain"), "{text}");
+        let listed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["enabled"], true);
+        assert_eq!(
+            listed["cookies"].as_array().unwrap().len(),
+            Platform::ALL.len()
+        );
+        let tiktok = listed["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["platform"] == "tiktok")
+            .unwrap();
+        assert_eq!(tiktok["present"], true);
+        assert!(tiktok["mtime"].is_u64());
+        assert_eq!(
+            listed["cookies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["platform"] == "youtube")
+                .unwrap()["present"],
+            false
+        );
+
+        let (status, _, body) = request(app.clone(), Method::DELETE, "/cookies/tiktok", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["deleted"],
+            true
+        );
+        assert!(!file.exists());
+
+        let (status, _, body) = request(app.clone(), Method::DELETE, "/cookies/tiktok", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["deleted"],
+            false
+        );
+
+        let (status, _, body) =
+            request(app, Method::PUT, "/cookies/vimeo", Some("a=b".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("unknown platform"));
+    }
+
+    #[tokio::test]
+    async fn requires_bearer_token_for_cookie_writes_when_configured() {
+        let harness = Harness::new("");
+        let cookies = TempDir::new().unwrap();
+        let dir = cookies.path().join("store");
+        let app = app(harness.config_with_cookie_store(
+            Duration::from_secs(30),
+            dir.clone(),
+            Some("s3cret"),
+        ));
+
+        let (status, _, _) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/x",
+            Some("auth_token=abc".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        let (status, _, _) = request_with_headers(
+            app.clone(),
+            Method::PUT,
+            "/cookies/x",
+            Some("auth_token=abc".into()),
+            headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer s3cret"),
+        );
+        let (status, _, _) = request_with_headers(
+            app.clone(),
+            Method::PUT,
+            "/cookies/x",
+            Some("auth_token=abc".into()),
+            headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(dir.join("x.txt").exists());
+
+        let (status, _, _) = request(app.clone(), Method::GET, "/cookies", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = request(app, Method::DELETE, "/cookies/x", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(dir.join("x.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn cookie_writes_require_a_cookie_dir() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        let (status, _, body) = request(
+            app.clone(),
+            Method::PUT,
+            "/cookies/youtube",
+            Some("SID=a".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("IXIAN_COOKIE_DIR"));
+
+        let (status, _, body) = request(app.clone(), Method::GET, "/cookies", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["enabled"], false);
+        assert!(listed["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["present"] == false));
+
+        let (status, _, _) = request(app, Method::DELETE, "/cookies/youtube", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

@@ -1,7 +1,7 @@
 # ixian
 
 Minimal yt-dlp wrapper server written in Rust.
-Downloads videos from **YouTube**, **x.com/twitter.com** and **Instagram**, with per-platform cookie support.
+Downloads videos from **YouTube**, **x.com/twitter.com**, **Instagram** and **TikTok**, with per-platform cookie support.
 
 ## Requirements
 
@@ -43,8 +43,22 @@ docker run -d --name ixian -p 127.0.0.1:3000:3000 --restart unless-stopped ixian
 
 Multi-stage build: `rust:1.99` compiles the binary, `node:24-bookworm-slim` runs it with Node
 (yt-dlp's JS runtime for YouTube challenges), yt-dlp (PyPI + EJS) and ffmpeg. `HOST=0.0.0.0`,
-`YTDLP_PATH`, `YTDLP_PLUGIN_DIR` and the yt-dlp config (`--js-runtimes node`) are preset.
-Any [config](#config-env) var can be overridden with `-e`, e.g. `-e YTDLP_FORMAT='bv*+ba/b'`.
+`YTDLP_PATH`, `YTDLP_PLUGIN_DIR`, `IXIAN_COOKIE_DIR=/data/cookies` and the yt-dlp config
+(`--js-runtimes node`) are preset. Any [config](#config-env) var can be overridden with `-e`,
+e.g. `-e YTDLP_FORMAT='bv*+ba/b'`.
+
+Mount a volume at `/data/cookies` to persist the [cookie store](#cookie-store) across restarts:
+
+```sh
+docker run -d --name ixian -p 127.0.0.1:3000:3000 --restart unless-stopped \
+  -v ixian-cookies:/data/cookies \
+  -e IXIAN_TOKEN='change-me' \
+  ghcr.io/zeromask1337/ixian:latest
+```
+
+For a bind mount, make it writable by the container user (uid/gid `1000`):
+`mkdir -p ./cookies && sudo chown 1000:1000 ./cookies && chmod 700 ./cookies`, then
+`-v "$PWD/cookies:/data/cookies"`.
 
 ## API
 
@@ -53,8 +67,8 @@ Any [config](#config-env) var can be overridden with `-e`, e.g. `-e YTDLP_FORMAT
 | param | description |
 | --- | --- |
 | `url` | **required** video URL |
-| `platform` | optional override: `youtube`, `x`, `instagram` (otherwise detected from the URL) |
-| `youtube_cookies` / `x_cookies` / `instagram_cookies` | cookies for that platform (only the matching one is used) |
+| `platform` | optional override: `youtube`, `x`, `instagram`, `tiktok` (otherwise detected from the URL) |
+| `youtube_cookies` / `x_cookies` / `instagram_cookies` / `tiktok_cookies` | cookies for that platform (only the matching one is used; overrides the [cookie store](#cookie-store)) |
 | `format` | optional yt-dlp format selector (default: best mp4) |
 | `timeout_ms` | optional download timeout (default `600000`, or `YTDLP_TIMEOUT_MS`) |
 
@@ -97,12 +111,42 @@ The cookie parameter accepts either:
 For Playwright exports, join the cookie array into a header string:
 ``cookies.map(c => `${c.name}=${c.value}`).join("; ")``.
 
-Cookies are written to a temp file (`chmod 600`), passed to yt-dlp via `--cookies`, and deleted with the download after the response is sent. They are never logged.
+Cookies (request or [store](#cookie-store)) are copied to a per-download temp file (`chmod 600`), passed to yt-dlp via `--cookies`, and deleted with the download after the response is sent. They are never logged.
+
+### Cookie store
+
+Set `IXIAN_COOKIE_DIR` to keep cookies on the server instead of sending them with every request. The server auto-loads `<platform>.txt` (`youtube.txt`, `x.txt`, `instagram.txt`, `tiktok.txt`) per download — a Netscape export or a raw `Cookie:` header — and cookies in the request (query or JSON) take precedence over the file.
+
+Export cookies for a logged-in session as a Netscape file, for example with the [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) browser extension, then either drop the file into the directory or upload it:
+
+```sh
+mkdir -p ~/.ixian-cookies && chmod 700 ~/.ixian-cookies
+IXIAN_COOKIE_DIR=~/.ixian-cookies cargo run --release
+
+# copy an export into place, or upload it (atomic replace)
+cp ~/Downloads/www.youtube.com_cookies.txt ~/.ixian-cookies/youtube.txt
+curl -X PUT http://127.0.0.1:3000/cookies/youtube \
+  --data-binary @www.youtube.com_cookies.txt
+
+# raw Cookie header works too
+curl -X PUT http://127.0.0.1:3000/cookies/x \
+  --data-binary 'auth_token=...; ct0=...'
+
+curl http://127.0.0.1:3000/cookies          # presence + mtime only, never values
+curl -X DELETE http://127.0.0.1:3000/cookies/youtube
+```
+
+- `PUT` accepts a raw `Cookie:` header or a Netscape file and normalizes it to Netscape format. `DELETE` is idempotent (`{"deleted":false}` when nothing was stored).
+- Files are written atomically (`0600`) in a `0700` directory, so a crash or concurrent `PUT` never leaves a partial jar. Each download gets a private copy, so rotating cookies does not affect downloads already running.
+- Set `IXIAN_TOKEN` to require `Authorization: Bearer <token>` on cookie writes (`PUT`/`DELETE /cookies/{platform}`). If it is unset, writes are open like the rest of the API — keep the server on localhost or behind Cloudflare Access, and set `IXIAN_TOKEN` whenever others can reach it.
+- `GET /cookies` stays open and returns only `platform`, `present` and `mtime` (unix seconds).
+- Rotate by repeating `PUT`; the replacement is atomic. Re-export after a login/password change or extractor `401`/login failures, and before cookies expire. Expired cookies are worse than none for some platforms.
+- Docker: the image sets `IXIAN_COOKIE_DIR=/data/cookies`; see [Docker](#docker) for the volume mount. For a bind mount, make the host directory writable by uid `1000` (the `node` user).
 
 ### Response
 
 - Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform` header). Temp files are cleaned up after streaming.
-- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request), `404`, `405`, `502` (yt-dlp failed/timeout), `500`.
+- Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request), `401` (cookie write without a valid `IXIAN_TOKEN`), `404`, `405`, `413` (cookie file too large), `502` (yt-dlp failed/timeout), `500`.
 
 ## Apple Shortcut
 
@@ -148,6 +192,8 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 | `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
+| `IXIAN_COOKIE_DIR` | unset | cookie store directory (Docker: `/data/cookies`); auto-loads `<platform>.txt` and enables cookie writes |
+| `IXIAN_TOKEN` | unset | require `Authorization: Bearer <token>` on cookie writes; unset leaves them open |
 
 ## Notes
 
@@ -159,6 +205,7 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
   - `ixian_ig` rewrites media URLs to the shared `scontent.cdninstagram.com` endpoint (`IXIAN_IG_CDN_HOST`).
   The plugins are loaded with `--plugin-dirs` (`YTDLP_PLUGIN_DIR`; the default `yt-dlp-plugins` next to `src/` is skipped when missing); no global yt-dlp config is touched.
+- TikTok: `tiktok.com`, `vm.tiktok.com` and `vt.tiktok.com` links are detected; cookies are written for `.tiktok.com`. TikTok rotates session cookies (`ttwid`, `msToken`, `tt_chain_token`, `sessionid`), so a stale export can cause empty formats or login errors — re-export from a logged-in browser session and `PUT` again. Region- and age-gated posts need cookies from an account allowed to view them; photo/slideshow posts are not videos. TikTok uses the default format selector (H.264/AAC preferred) and returns whatever yt-dlp extracts (watermark availability depends on the extractor).
 - Respect each platform's terms of service and only download content you have the right to.
 
 ## Tests
@@ -168,7 +215,7 @@ cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, request validation, yt-dlp failures and timeouts without touching the network.
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, cookie store auto-load/override/atomic write, request validation, yt-dlp failures and timeouts without touching the network.
 
 Smoke-tested end to end against public media (2026-10-27):
 
