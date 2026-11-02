@@ -57,6 +57,7 @@ Any [config](#config-env) var can be overridden with `-e`, e.g. `-e YTDLP_FORMAT
 | `youtube_cookies` / `x_cookies` / `instagram_cookies` | cookies for that platform (only the matching one is used) |
 | `format` | optional yt-dlp format selector (default: best mp4) |
 | `timeout_ms` | optional download timeout (default `600000`, or `YTDLP_TIMEOUT_MS`) |
+| `inline` | `1` serves `content-disposition: inline` for browser playback (default: attachment) |
 
 ```sh
 curl -G http://127.0.0.1:3000/download \
@@ -99,9 +100,30 @@ For Playwright exports, join the cookie array into a header string:
 
 Cookies are written to a temp file (`chmod 600`), passed to yt-dlp via `--cookies`, and deleted with the download after the response is sent. They are never logged.
 
+### Cache
+
+Downloads are cached on disk. The key is
+`SHA-256(platform + normalized URL + format + cookie fingerprint)`, so tracking
+params, `youtu.be`/`twitter.com` aliases and query order do not cause duplicate
+downloads. Requests that send cookies are cached under a hash of the cookies,
+never the cookie contents.
+
+Cache hits are served through `tower-http`'s `ServeFile`, so `Range`,
+`If-None-Match`, `ETag` and `HEAD` work on both cache hits and misses. Concurrent
+requests for the same key share one yt-dlp process. Entries are evicted least
+recently used once `CACHE_MAX_BYTES` is exceeded.
+
+```sh
+curl 'http://127.0.0.1:3000/cache/stats'
+curl -X DELETE 'http://127.0.0.1:3000/cache'
+```
+
+`GET /cache/stats` and `DELETE /cache` are open by default. Set `IXIAN_TOKEN` to
+require `Authorization: Bearer <token>` (or `x-ixian-token: <token>`).
+
 ### Response
 
-- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform` header). Temp files are cleaned up after streaming.
+- Success: the media file itself (`content-disposition: attachment`, `x-ixian-platform`, `Cache-Control: private`, `ETag`, `Accept-Ranges: bytes`). `inline=1` (or `"inline": true` in JSON) switches to `content-disposition: inline` for browser playback. Temp files are cleaned up after streaming.
 - Errors: JSON `{ "error": "...", "hint"? }` with status `400` (bad request), `404`, `405`, `502` (yt-dlp failed/timeout), `500`.
 
 ## Apple Shortcut
@@ -148,13 +170,17 @@ Flow: share a link (or copy one and run from the menu bar) -> POST `/download` -
 | `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
+| `IXIAN_CACHE_DIR` | `<tmp>/ixian-cache` | disk cache directory (`off` disables caching) |
+| `CACHE_TTL` | `604800` | entry lifetime in seconds (`0` never expires) |
+| `CACHE_MAX_BYTES` | `10737418240` | LRU byte budget (`0` unlimited) |
+| `IXIAN_TOKEN` | unset | require this bearer token for `GET /cache/stats` and `DELETE /cache` |
 
 ## Notes
 
 - The whole server is one file (`src/main.rs`) built on `axum`, `tokio::process` and `tokio::fs`; the only external runtime dependencies are `yt-dlp` and `ffmpeg`.
 - The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself.
 - Playlists are disabled (`--no-playlist` plus `--playlist-items 1`): one URL yields one file. For an X post that quotes another post (or carries several videos), the linked post's first video is returned, not the quoted/original one.
-- Downloads are saved to a unique temp file and streamed back, then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
+- Downloads are staged in a unique temp directory. With caching enabled the media is hard-linked/copied into `IXIAN_CACHE_DIR` and served from there; without a cached copy the temp file is streamed and then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
 - Instagram: some networks drop TLS for `*.instagram.com` and geo-picked CDN edges. Two bundled yt-dlp plugins work around that:
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
   - `ixian_ig` rewrites media URLs to the shared `scontent.cdninstagram.com` endpoint (`IXIAN_IG_CDN_HOST`).
@@ -168,7 +194,7 @@ cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, request validation, yt-dlp failures and timeouts without touching the network.
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation/permissions, request validation, yt-dlp failures and timeouts without touching the network. Cache tests cover hit/miss, URL normalization, `Range`, `HEAD`, `304`, concurrent same-key dedupe, LRU eviction and admin auth.
 
 Smoke-tested end to end against public media (2026-10-27):
 
