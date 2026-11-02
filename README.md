@@ -109,6 +109,34 @@ jq -n --rawfile c cookies.txt \
     -H 'content-type: application/json' --data-binary @- -o video.mp4
 ```
 
+### Async jobs
+
+Use jobs when a request may outlive a mobile connection. `POST /jobs` takes the same JSON body as `POST /download` and returns `202 Accepted` immediately:
+
+```sh
+id=$(curl -s -X POST http://127.0.0.1:3000/jobs \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}' |
+  jq -r .id)
+```
+
+| endpoint | description |
+| --- | --- |
+| `POST /jobs` | enqueue a download; returns `{id, status, position}` |
+| `GET /jobs/{id}` | returns `{id, status, progress, bytes, total_bytes, eta, position, error}` |
+| `GET /jobs/{id}/file` | streams the finished file; supports single `Range` and `HEAD` |
+| `DELETE /jobs/{id}` | cancels a queued or running job and kills its process group |
+
+Status moves `queued -> running -> done`, or ends as `failed` / `cancelled`. `progress` is a percentage (`0`-`100`), `bytes` is downloaded bytes, `eta` is best-effort seconds, and `position` is 1-based while queued (`0` otherwise). Failures carry `error: {error, code, hint}`. Jobs accept the same `mode`, `quality`, `container`, `item` and cookie options as `/download`, and use the same disk cache (a finished job populates it; a cache hit completes the job without running yt-dlp).
+
+```sh
+curl -s http://127.0.0.1:3000/jobs/$id
+curl -L http://127.0.0.1:3000/jobs/$id/file -o video.mp4
+curl -X DELETE http://127.0.0.1:3000/jobs/$id
+```
+
+Jobs are held in memory (a restart loses history). At most `MAX_CONCURRENT` downloads (sync or jobs) run at once, with up to `MAX_QUEUE` jobs waiting for a slot; extra job requests get `429`. Finished jobs and their files are deleted after `JOB_TTL_MS`.
+
 ### `GET/POST /info`
 
 Probes a URL with `yt-dlp -J --no-playlist --playlist-items 1` and returns trimmed
@@ -207,7 +235,8 @@ require `Authorization: Bearer <token>` (or `x-ixian-token: <token>`).
 
 | limit | value |
 | --- | --- |
-| concurrent downloads | `4` (`MAX_CONCURRENT`; excess requests return `429`) |
+| concurrent downloads | `4` (`MAX_CONCURRENT`, sync and jobs combined; excess sync requests return `429`, extra jobs wait) |
+| job queue | `32` (`MAX_QUEUE`; extra `POST /jobs` requests return `429`) |
 | request timeout | `600000` ms (`MAX_TIMEOUT_MS`; larger values return `400`) |
 | cookie parameter | `256 KiB` (`MAX_COOKIE_BYTES`) |
 | stored cookie file | `1 MiB` (`MAX_STORED_COOKIE_BYTES`) |
@@ -266,6 +295,9 @@ Flow: share a link (or copy one and run from the menu bar) -> choose **Best / 72
 | `YTDLP_FORMAT` | best playable mp4 (H.264/AAC) | selector for `quality=best` when `format` is not passed |
 | `YTDLP_TIMEOUT_MS` | `600000` | default per-download timeout (capped at `MAX_TIMEOUT_MS`) |
 | `YTDLP_INFO_TIMEOUT_MS` | `15000` | default `/info` probe timeout |
+| `MAX_CONCURRENT` | `4` | maximum downloads running at once, sync and async jobs combined |
+| `MAX_QUEUE` | `32` | maximum async jobs waiting for a download slot |
+| `JOB_TTL_MS` | `3600000` | how long finished jobs/files are kept |
 | `IXIAN_SNI` | `example.com` | decoy TLS SNI for Meta hosts (empty/`off` disables); see below |
 | `IXIAN_IG_CDN_HOST` | `scontent.cdninstagram.com` | shared Instagram CDN host (empty disables the rewrite) |
 | `IXIAN_COOKIE_DIR` | unset | cookie store directory (Docker: `/data/cookies`); auto-loads `<platform>.txt` and enables cookie writes |
@@ -279,7 +311,7 @@ Flow: share a link (or copy one and run from the menu bar) -> choose **Best / 72
 - The whole server is one file (`src/main.rs`) built on `axum`, `tokio::process` and `tokio::fs`; the only external runtime dependencies are `yt-dlp` and `ffmpeg`.
 - The default format prefers H.264/AAC so files play in QuickTime. Instagram's 1080p DASH formats are VP9 (and YouTube's 4K is VP9/AV1) which QuickTime cannot decode — pass `"format": "bv*+ba/b"` to fetch those (playable in VLC/ffmpeg), or install `ffmpeg` and transcode yourself. `quality` caps height server-side; `format` is the advanced escape hatch and wins over `quality`.
 - Playlists are disabled (`--no-playlist` plus `--playlist-items N`): one URL yields one file. `item=N` picks the Nth video; by default the linked post's first video is returned, not the quoted/original one.
-- Downloads are staged in a unique temp directory. With caching enabled the media is hard-linked/copied into `IXIAN_CACHE_DIR` and served from there; without a cached copy the temp file is streamed and then deleted. There is no server idle timeout, so large files can stream for as long as the client reads them.
+- Downloads are staged in a unique temp directory. With caching enabled the media is hard-linked/copied into `IXIAN_CACHE_DIR` and served from there; without a cached copy the temp file is streamed and then deleted. Async jobs keep their finished file in a private job directory until it expires (`JOB_TTL_MS`) and populate the same cache. There is no server idle timeout, so large files can stream for as long as the client reads them.
 - Instagram: some networks drop TLS for `*.instagram.com` and geo-picked CDN edges. Two bundled yt-dlp plugins work around that:
   - `ixian_net` connects to Meta with a decoy SNI (`IXIAN_SNI`) while verifying the certificate against the real host.
   - `ixian_ig` rewrites media URLs to the shared `scontent.cdninstagram.com` endpoint (`IXIAN_IG_CDN_HOST`).
@@ -294,7 +326,7 @@ cargo test          # unit + HTTP integration tests (stubbed yt-dlp)
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests exercise streaming, temp-file cleanup, cookie jar generation and permissions (temp dir `0700`, jar `0600`), cookie store auto-load/override/atomic write, URL/platform allowlist checks, GET cookie rejection, timeout aliases and caps, concurrency (`429`), stderr/output-size caps, `--` argument termination, process-group kills (timeout and cancellation), yt-dlp failures and bounded pipe drains without touching the network. Preset tests cover audio extraction, quality/container selectors, playlist `item`, `/info` trimming and playlist entry selection, and classified `{code, hint}` errors. Cache tests cover hit/miss, URL normalization, `Range`, `HEAD`, `304`, concurrent same-key dedupe, LRU eviction and admin auth.
+The integration tests exercise streaming, temp-file cleanup, cookie jar generation and permissions (temp dir `0700`, jar `0600`), cookie store auto-load/override/atomic write, URL/platform allowlist checks, GET cookie rejection, timeout aliases and caps, concurrency (`429`), stderr/output-size caps, `--` argument termination, process-group kills (timeout and cancellation), yt-dlp failures and bounded pipe drains without touching the network. Preset tests cover audio extraction, quality/container selectors, playlist `item`, `/info` trimming and playlist entry selection, and classified `{code, hint}` errors. Cache tests cover hit/miss, URL normalization, `Range`, `HEAD`, `304`, concurrent same-key dedupe, LRU eviction and admin auth. Job tests cover progress, queueing and cancellation, process-group cleanup, `Range`/`HEAD` on finished files, TTL expiry and cache sharing.
 
 Smoke-tested end to end against public media (2026-10-27):
 

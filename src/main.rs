@@ -4,14 +4,14 @@ use axum::{
     extract::{DefaultBodyLimit, Path as UrlPath, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -22,17 +22,17 @@ use std::{
         Arc, Mutex as StdMutex, Weak,
     },
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf},
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
-    time::timeout,
+    sync::{watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
+    time::{interval, timeout},
 };
-use tokio_util::io::ReaderStream;
+use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use url::Url;
@@ -56,6 +56,8 @@ const STREAM_CHUNK: usize = 64 * 1024;
 const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_CONCURRENT: usize = 4;
+const DEFAULT_MAX_QUEUE: usize = 32;
+const DEFAULT_JOB_TTL_MS: u64 = 3_600_000;
 const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const MAX_COOKIE_BYTES: usize = 256 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
@@ -65,6 +67,8 @@ const SOCKET_TIMEOUT_SECS: u64 = 10;
 const RETRIES: u64 = 3;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const KILL_TIMEOUT: Duration = Duration::from_secs(2);
+const PROGRESS_PREFIX: &str = "ixian-progress|";
+const JOB_PROGRESS_TEMPLATE: &str = "download:ixian-progress|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.eta)s|%(progress._percent_str)s";
 const FILENAME_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
@@ -306,6 +310,8 @@ struct Config {
     token: Option<String>,
     downloads: Arc<Semaphore>,
     max_filesize: u64,
+    max_queue: usize,
+    job_ttl: Duration,
 }
 
 impl Config {
@@ -332,6 +338,20 @@ impl Config {
             .and_then(|v| parse_ms(&v))
             .unwrap_or_else(|| Duration::from_millis(DEFAULT_INFO_TIMEOUT_MS))
             .min(Duration::from_millis(MAX_TIMEOUT_MS));
+        let max_concurrent = env::var("MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(MAX_CONCURRENT);
+        let max_queue = env::var("MAX_QUEUE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_QUEUE);
+        let job_ttl = env::var("JOB_TTL_MS")
+            .ok()
+            .and_then(|value| parse_ms(&value))
+            .unwrap_or_else(|| Duration::from_millis(DEFAULT_JOB_TTL_MS));
         let tmp = non_empty(env::var("TMPDIR").ok())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -379,8 +399,10 @@ impl Config {
             cache,
             cookie_dir,
             token,
-            downloads: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            downloads: Arc::new(Semaphore::new(max_concurrent)),
             max_filesize: MAX_FILESIZE,
+            max_queue,
+            job_ttl,
         }
     }
 }
@@ -705,19 +727,18 @@ impl Cache {
     async fn insert(
         &self,
         key: &str,
-        media: &DownloadedMedia,
+        path: &Path,
+        name: &str,
+        mime: &str,
+        size: u64,
         platform: Platform,
     ) -> Option<CacheEntry> {
-        if self
-            .max_bytes
-            .is_some_and(|max_bytes| media.size > max_bytes)
-        {
+        if self.max_bytes.is_some_and(|max_bytes| size > max_bytes) {
             return None;
         }
         self.ensure_dirs().await.ok()?;
 
-        let extension = media
-            .path
+        let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
             .filter(|extension| {
@@ -731,9 +752,9 @@ impl Cache {
         let meta = CacheMeta {
             key: key.to_string(),
             file: file.clone(),
-            name: media.name.clone(),
-            size: media.size,
-            content_type: media.mime.clone(),
+            name: name.to_string(),
+            size,
+            content_type: mime.to_string(),
             platform: platform.name().to_string(),
             created: now,
             last_used: now,
@@ -745,9 +766,7 @@ impl Cache {
             .join(format!("ixian-{}", Uuid::new_v4()));
         fs::create_dir_all(&staging).await.ok()?;
         let staged = staging.join(&file);
-        if fs::hard_link(&media.path, &staged).await.is_err()
-            && fs::copy(&media.path, &staged).await.is_err()
-        {
+        if fs::hard_link(path, &staged).await.is_err() && fs::copy(path, &staged).await.is_err() {
             let _ = fs::remove_dir_all(&staging).await;
             return None;
         }
@@ -1683,9 +1702,20 @@ async fn run_ytdlp(mut command: Command, limit: Duration) -> Result<YtdlpOutput,
     })
 }
 
-async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedMedia, ApiError> {
+struct PreparedDownload {
+    jar: Option<PathBuf>,
+    selector: String,
+    hint: Option<&'static str>,
+}
+
+/// Resolves cookies (request or stored) and writes the private cookie jar, then
+/// builds the format selector shared by synchronous and asynchronous downloads.
+async fn prepare_download(
+    config: &Config,
+    request: &DownloadRequest,
+    dir: &Path,
+) -> Result<PreparedDownload, ApiError> {
     let platform = request.platform;
-    let url = request.url.replace('\\', "");
     let cookies = request
         .cookies
         .clone()
@@ -1704,18 +1734,8 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
     };
     let has_cookies = cookies.is_some();
     let hint = has_cookies.then_some(COOKIE_HINT);
-    let permit = config.downloads.clone().try_acquire_owned().map_err(|_| {
-        ApiError::too_many_requests(format!(
-            "too many concurrent downloads (limit: {MAX_CONCURRENT})"
-        ))
-    })?;
-
-    let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
-    create_private_dir(&dir)
-        .map_err(|error| ApiError::internal(format!("cannot create temp directory: {error}")))?;
-    let jar = dir.join("cookies.txt");
-    let cleanup = Cleanup::new(dir.clone());
-    if let Some(cookies) = cookies.as_deref() {
+    let jar = has_cookies.then(|| dir.join("cookies.txt"));
+    if let (Some(jar), Some(cookies)) = (jar.as_deref(), cookies.as_deref()) {
         let contents = cookie_file(cookies, platform);
         // Stored cookie files may be larger than a request cookie; both are
         // bounded well below the body limit.
@@ -1724,7 +1744,7 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
                 "cookies exceed the {MAX_STORED_COOKIE_BYTES} byte limit"
             )));
         }
-        write_cookie_jar(&jar, &contents)
+        write_cookie_jar(jar, &contents)
             .map_err(|error| ApiError::internal(format!("cannot write cookie jar: {error}")))?;
     }
 
@@ -1736,24 +1756,46 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
         }
     });
 
+    Ok(PreparedDownload {
+        jar,
+        selector,
+        hint,
+    })
+}
+
+fn download_command(
+    config: &Config,
+    request: &DownloadRequest,
+    prepared: &PreparedDownload,
+    dir: &Path,
+    progress: bool,
+) -> Command {
     let mut cmd = Command::new(&config.ytdlp);
     cmd.arg("--no-playlist")
         // `--no-playlist` does not collapse tweets that reference other tweets
         // (yt-dlp returns them as a playlist), so pin the requested item explicitly.
         .arg("--playlist-items")
-        .arg(request.item.to_string())
-        .arg("--no-progress")
-        .arg("--no-simulate")
-        .arg("--print")
-        .arg("after_move:filepath")
-        .arg("--socket-timeout")
+        .arg(request.item.to_string());
+    if progress {
+        // Jobs read progress from stderr and the final path from `--print-to-file`.
+        cmd.arg("--newline")
+            .arg("--progress-template")
+            .arg(JOB_PROGRESS_TEMPLATE);
+    } else {
+        cmd.arg("--no-progress");
+    }
+    cmd.arg("--no-simulate");
+    if !progress {
+        cmd.arg("--print").arg("after_move:filepath");
+    }
+    cmd.arg("--socket-timeout")
         .arg(SOCKET_TIMEOUT_SECS.to_string())
         .arg("--retries")
         .arg(RETRIES.to_string())
         .arg("--max-filesize")
         .arg(config.max_filesize.to_string())
         .arg("-f")
-        .arg(&selector)
+        .arg(&prepared.selector)
         .arg("-o")
         .arg(dir.join("%(title)s [%(id)s].%(ext)s"));
     if request.mode.is_audio() {
@@ -1769,11 +1811,30 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
     if let Some(plugin_dir) = &config.plugin_dir {
         cmd.arg("--plugin-dirs").arg(plugin_dir);
     }
-    if has_cookies {
-        cmd.arg("--cookies").arg(&jar);
+    if let Some(jar) = &prepared.jar {
+        cmd.arg("--cookies").arg(jar);
     }
     // `--` terminates option parsing so a leading dash can never become a flag.
-    cmd.arg("--").arg(&url);
+    cmd.arg("--").arg(request.url.replace('\\', ""));
+    cmd
+}
+
+async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedMedia, ApiError> {
+    let platform = request.platform;
+    let permit = config.downloads.clone().try_acquire_owned().map_err(|_| {
+        ApiError::too_many_requests(format!(
+            "too many concurrent downloads (limit: {MAX_CONCURRENT})"
+        ))
+    })?;
+
+    let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
+    create_private_dir(&dir)
+        .map_err(|error| ApiError::internal(format!("cannot create temp directory: {error}")))?;
+    let cleanup = Cleanup::new(dir.clone());
+    let prepared = prepare_download(config, request, &dir).await?;
+    let hint = prepared.hint;
+
+    let cmd = download_command(config, request, &prepared, &dir, false);
 
     let limit = request.timeout.unwrap_or(config.timeout);
     let output = run_ytdlp(cmd, limit).await?;
@@ -1979,18 +2040,7 @@ async fn download(
     };
 
     // Stored cookies change the response, so they are part of the cache key too.
-    let effective_cookies = match request.cookies.as_deref().map(str::trim) {
-        Some(cookies) if !cookies.is_empty() => request.cookies.clone(),
-        _ => stored_cookies(config, request.platform).await?,
-    };
-    let format = request.format.as_deref().unwrap_or(&config.format);
-    let key = cache_key(
-        request.platform,
-        &request.url,
-        format,
-        &request.cache_variant(),
-        effective_cookies.as_deref(),
-    );
+    let key = download_cache_key(config, &request).await?;
     let key_lock = cache.key_lock(&key);
     let _guard = key_lock.lock().await;
 
@@ -2001,11 +2051,41 @@ async fn download(
     cache.misses.fetch_add(1, Ordering::Relaxed);
 
     let media = fetch(config, &request).await?;
-    let Some(entry) = cache.insert(&key, &media, request.platform).await else {
+    let Some(entry) = cache
+        .insert(
+            &key,
+            &media.path,
+            &media.name,
+            &media.mime,
+            media.size,
+            request.platform,
+        )
+        .await
+    else {
         return stream_media(media, request.inline).await;
     };
     drop(media);
     Ok(serve_entry(entry, &request, method, headers).await)
+}
+
+/// Cache key for a download, including cookies that were auto-loaded from the
+/// store. Stored cookies change the response, so they partition the cache.
+async fn download_cache_key(
+    config: &Config,
+    request: &DownloadRequest,
+) -> Result<String, ApiError> {
+    let effective_cookies = match request.cookies.as_deref().map(str::trim) {
+        Some(cookies) if !cookies.is_empty() => request.cookies.clone(),
+        _ => stored_cookies(config, request.platform).await?,
+    };
+    let format = request.format.as_deref().unwrap_or(&config.format);
+    Ok(cache_key(
+        request.platform,
+        &request.url.replace('\\', ""),
+        format,
+        &request.cache_variant(),
+        effective_cookies.as_deref(),
+    ))
 }
 
 async fn stream_media(media: DownloadedMedia, inline: bool) -> ApiResult {
@@ -2053,7 +2133,29 @@ async fn serve_entry(
     headers: HeaderMap,
 ) -> Response {
     let CacheEntry { path, meta } = entry;
-    let inline = request.inline;
+    serve_file(
+        &path,
+        &meta.name,
+        &meta.content_type,
+        &meta.platform,
+        request.inline,
+        method,
+        headers,
+    )
+    .await
+}
+
+/// Serves a finished file with `Range`/`HEAD`/conditional support. Used for
+/// both disk-cache hits and finished async jobs.
+async fn serve_file(
+    path: &Path,
+    name: &str,
+    mime: &str,
+    platform: &str,
+    inline: bool,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
     let method = if method == Method::GET || method == Method::HEAD {
         method
     } else {
@@ -2075,13 +2177,13 @@ async fn serve_entry(
         Ok(request) => request,
         Err(error) => return ApiError::internal(error.to_string()).into_response(),
     };
-    let mut response = match ServeFile::new(&path).oneshot(request).await {
+    let mut response = match ServeFile::new(path).oneshot(request).await {
         Ok(response) => response.map(Body::new),
         Err(never) => match never {},
     };
-    add_media_headers(response.headers_mut(), &meta.name, &meta.platform, inline);
+    add_media_headers(response.headers_mut(), name, platform, inline);
     if response.status() != StatusCode::NOT_MODIFIED {
-        if let Ok(value) = HeaderValue::from_str(&meta.content_type) {
+        if let Ok(value) = HeaderValue::from_str(mime) {
             response.headers_mut().insert(header::CONTENT_TYPE, value);
         }
     }
@@ -2103,6 +2205,706 @@ fn add_media_headers(headers: &mut HeaderMap, name: &str, platform: &str, inline
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    fn name(self) -> &'static str {
+        match self {
+            JobStatus::Queued => "queued",
+            JobStatus::Running => "running",
+            JobStatus::Done => "done",
+            JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JobFailure {
+    error: String,
+    code: &'static str,
+    hint: Option<String>,
+}
+
+impl JobFailure {
+    fn new(error: impl Into<String>, code: &'static str, hint: Option<&str>) -> Self {
+        Self {
+            error: error.into(),
+            code,
+            hint: hint.map(str::to_string),
+        }
+    }
+
+    fn from_api(error: ApiError, code: &'static str) -> Self {
+        Self {
+            error: error.message,
+            code,
+            hint: error.hint,
+        }
+    }
+}
+
+/// A finished download owned by a job. The file stays in the job's private
+/// directory until `JOB_TTL_MS` expires.
+struct JobMedia {
+    path: PathBuf,
+    name: String,
+    mime: String,
+    size: u64,
+}
+
+struct JobState {
+    status: JobStatus,
+    progress: f64,
+    bytes: u64,
+    total_bytes: Option<u64>,
+    eta: Option<u64>,
+    error: Option<JobFailure>,
+    dir: Option<PathBuf>,
+    media: Option<JobMedia>,
+    finished_at: Option<Instant>,
+}
+
+impl JobState {
+    fn new() -> Self {
+        Self {
+            status: JobStatus::Queued,
+            progress: 0.0,
+            bytes: 0,
+            total_bytes: None,
+            eta: None,
+            error: None,
+            dir: None,
+            media: None,
+            finished_at: None,
+        }
+    }
+}
+
+struct Job {
+    id: Uuid,
+    request: DownloadRequest,
+    state: StdMutex<JobState>,
+    cancel: CancellationToken,
+    finished: watch::Sender<bool>,
+}
+
+impl Job {
+    fn new(id: Uuid, request: DownloadRequest) -> Self {
+        let (finished, _) = watch::channel(false);
+        Self {
+            id,
+            request,
+            state: StdMutex::new(JobState::new()),
+            cancel: CancellationToken::new(),
+            finished,
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, JobState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn json(&self, position: usize) -> Value {
+        let state = self.lock_state();
+        json!({
+            "id": self.id.to_string(),
+            "status": state.status.name(),
+            "progress": (state.progress * 10.0).round() / 10.0,
+            "bytes": state.bytes,
+            "total_bytes": state.total_bytes,
+            "eta": state.eta,
+            "position": position,
+            "error": state.error.as_ref().map(|failure| json!({
+                "error": failure.error,
+                "code": failure.code,
+                "hint": failure.hint,
+            })),
+        })
+    }
+}
+
+struct JobsInner {
+    jobs: HashMap<Uuid, Arc<Job>>,
+    queue: VecDeque<Uuid>,
+}
+
+/// In-memory job registry. Jobs share the download semaphore with synchronous
+/// requests, so `MAX_CONCURRENT` bounds both together; extra jobs wait in
+/// `queue` instead of being rejected, up to `MAX_QUEUE`.
+struct Jobs {
+    inner: StdMutex<JobsInner>,
+    max_queue: usize,
+    ttl: Duration,
+}
+
+impl Jobs {
+    fn new(config: &Config) -> Self {
+        Self {
+            inner: StdMutex::new(JobsInner {
+                jobs: HashMap::new(),
+                queue: VecDeque::new(),
+            }),
+            max_queue: config.max_queue.max(1),
+            ttl: config.job_ttl,
+        }
+    }
+
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, JobsInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn enqueue(self: &Arc<Self>, request: DownloadRequest) -> Result<(Arc<Job>, usize), ApiError> {
+        let mut inner = self.lock_inner();
+        if inner.queue.len() >= self.max_queue {
+            let mut error = ApiError::too_many_requests(format!(
+                "job queue is full (MAX_QUEUE={})",
+                self.max_queue
+            ));
+            error.hint = Some("wait for queued jobs to finish or raise MAX_QUEUE".into());
+            return Err(error);
+        }
+
+        let job = Arc::new(Job::new(Uuid::new_v4(), request));
+        inner.jobs.insert(job.id, Arc::clone(&job));
+        inner.queue.push_back(job.id);
+        Ok((job, inner.queue.len()))
+    }
+
+    fn start(self: &Arc<Self>, config: Arc<Config>, job: Arc<Job>) {
+        let jobs = Arc::clone(self);
+        tokio::spawn(async move {
+            jobs.run(config, job).await;
+        });
+    }
+
+    async fn run(self: Arc<Self>, config: Arc<Config>, job: Arc<Job>) {
+        let permit = tokio::select! {
+            permit = config.downloads.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+            _ = job.cancel.cancelled() => {
+                self.finish(&job, JobOutcome::Cancelled).await;
+                return;
+            }
+        };
+
+        let should_run = {
+            let mut inner = self.lock_inner();
+            inner.queue.retain(|queued| *queued != job.id);
+            let mut state = job.lock_state();
+            if state.status == JobStatus::Queued {
+                state.status = JobStatus::Running;
+                true
+            } else {
+                false
+            }
+        };
+
+        let outcome = if should_run {
+            run_job(&config, &job).await
+        } else {
+            JobOutcome::Cancelled
+        };
+        self.finish(&job, outcome).await;
+        drop(permit);
+    }
+
+    async fn finish(&self, job: &Arc<Job>, outcome: JobOutcome) {
+        let mut done_dir = None;
+        let cleanup_dir = {
+            let mut inner = self.lock_inner();
+            inner.queue.retain(|queued| *queued != job.id);
+            let mut state = job.lock_state();
+            let cancelled = state.status == JobStatus::Cancelled;
+
+            if cancelled || matches!(&outcome, JobOutcome::Cancelled) {
+                state.status = JobStatus::Cancelled;
+                state.eta = None;
+                state.error = None;
+                state.media = None;
+                state.finished_at = Some(Instant::now());
+                state.dir.take()
+            } else {
+                match outcome {
+                    JobOutcome::Done(media) => {
+                        state.status = JobStatus::Done;
+                        state.progress = 100.0;
+                        state.bytes = media.size;
+                        state.total_bytes = Some(media.size);
+                        state.eta = Some(0);
+                        state.error = None;
+                        state.media = Some(media);
+                        state.finished_at = Some(Instant::now());
+                        done_dir = state.dir.clone();
+                        None
+                    }
+                    JobOutcome::Failed(failure) => {
+                        state.status = JobStatus::Failed;
+                        state.eta = None;
+                        state.error = Some(failure);
+                        state.media = None;
+                        state.finished_at = Some(Instant::now());
+                        state.dir.take()
+                    }
+                    JobOutcome::Cancelled => unreachable!(),
+                }
+            }
+        };
+
+        if let Some(dir) = cleanup_dir {
+            let _ = fs::remove_dir_all(dir).await;
+        }
+        if let Some(dir) = done_dir {
+            // Keep the media for `JOB_TTL_MS`, but never leave the cookie jar behind.
+            let keep = job
+                .lock_state()
+                .media
+                .as_ref()
+                .is_some_and(|media| media.name == "cookies.txt");
+            if !keep {
+                let _ = fs::remove_file(dir.join("cookies.txt")).await;
+            }
+        }
+        let _ = job.finished.send(true);
+    }
+
+    fn get(&self, id: Uuid) -> Option<Arc<Job>> {
+        self.lock_inner().jobs.get(&id).cloned()
+    }
+
+    fn snapshot(&self, id: Uuid) -> Option<Value> {
+        let inner = self.lock_inner();
+        let job = inner.jobs.get(&id)?;
+        let position = inner
+            .queue
+            .iter()
+            .position(|queued| *queued == id)
+            .map_or(0, |index| index + 1);
+        Some(job.json(position))
+    }
+
+    async fn cancel(&self, id: Uuid) -> Result<Value, ApiError> {
+        let job = {
+            let mut inner = self.lock_inner();
+            let job = inner.jobs.get(&id).cloned().ok_or_else(job_not_found)?;
+            let status = job.lock_state().status;
+            match status {
+                JobStatus::Queued | JobStatus::Running => {
+                    inner.queue.retain(|queued| *queued != id);
+                    let mut state = job.lock_state();
+                    state.status = JobStatus::Cancelled;
+                    state.eta = None;
+                    state.error = None;
+                    state.media = None;
+                    state.finished_at = Some(Instant::now());
+                    drop(state);
+                    job.cancel.cancel();
+                    job
+                }
+                JobStatus::Cancelled => job,
+                JobStatus::Done | JobStatus::Failed => {
+                    return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!("job is already {}", status.name()),
+                    ));
+                }
+            }
+        };
+
+        let mut finished = job.finished.subscribe();
+        if !*finished.borrow() {
+            let _ = timeout(Duration::from_secs(5), async {
+                loop {
+                    if *finished.borrow() || finished.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+
+        self.snapshot(id).ok_or_else(job_not_found)
+    }
+
+    fn cleanup_expired(&self) {
+        let now = Instant::now();
+        let mut dirs = Vec::new();
+        {
+            let mut inner = self.lock_inner();
+            let expired: Vec<Uuid> = inner
+                .jobs
+                .iter()
+                .filter_map(|(id, job)| {
+                    let state = job.lock_state();
+                    state
+                        .finished_at
+                        .is_some_and(|finished| now.duration_since(finished) >= self.ttl)
+                        .then_some(*id)
+                })
+                .collect();
+            for id in expired {
+                if let Some(job) = inner.jobs.remove(&id) {
+                    inner.queue.retain(|queued| *queued != id);
+                    if let Some(dir) = job.lock_state().dir.take() {
+                        dirs.push(dir);
+                    }
+                }
+            }
+        }
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    fn spawn_cleanup(self: Arc<Self>) {
+        let period = (self.ttl / 4).clamp(Duration::from_millis(100), Duration::from_secs(60));
+        tokio::spawn(async move {
+            let mut ticker = interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                self.cleanup_expired();
+            }
+        });
+    }
+}
+
+enum JobOutcome {
+    Done(JobMedia),
+    Failed(JobFailure),
+    Cancelled,
+}
+
+struct ProgressUpdate {
+    bytes: u64,
+    total: Option<u64>,
+    eta: Option<u64>,
+    percent: Option<f64>,
+}
+
+/// Runs one job's yt-dlp process, reporting progress on the job and stopping it
+/// on cancellation or timeout. The job owns its temp directory, so the media
+/// survives `fetch`-style cleanup until the job expires.
+async fn run_job(config: &Config, job: &Arc<Job>) -> JobOutcome {
+    let request = &job.request;
+    let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
+    if let Err(error) = create_private_dir(&dir) {
+        return JobOutcome::Failed(JobFailure::new(
+            format!("cannot create temp directory: {error}"),
+            "internal",
+            None,
+        ));
+    }
+    job.lock_state().dir = Some(dir.clone());
+    if job.cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+
+    let prepared = match prepare_download(config, request, &dir).await {
+        Ok(prepared) => prepared,
+        Err(error) => return JobOutcome::Failed(JobFailure::from_api(error, "internal")),
+    };
+    let hint = prepared.hint;
+
+    // A job reuses the disk cache like a synchronous download: a hit is
+    // hard-linked into the job directory, a miss is stored after it completes.
+    let cache_key = if config.cache.is_some() {
+        match download_cache_key(config, request).await {
+            Ok(key) => Some(key),
+            Err(error) => return JobOutcome::Failed(JobFailure::from_api(error, "internal")),
+        }
+    } else {
+        None
+    };
+    if let (Some(cache), Some(key)) = (&config.cache, cache_key.as_deref()) {
+        if let Some(entry) = cache.lookup(key).await {
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+            if let Some(media) = adopt_cache_entry(&entry, &dir).await {
+                return JobOutcome::Done(media);
+            }
+        } else {
+            cache.misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let path_file = dir.join("path.txt");
+    let mut cmd = download_command(config, request, &prepared, &dir, true);
+    cmd.arg("--print-to-file")
+        .arg("after_move:filepath")
+        .arg(&path_file);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return JobOutcome::Failed(JobFailure::new(
+                format!("failed to run yt-dlp: {error}"),
+                "spawn_failed",
+                hint,
+            ));
+        }
+    };
+    let mut group = ProcessGroup::new(child.id());
+
+    let Some(mut stdout_pipe) = child.stdout.take() else {
+        group.kill();
+        return JobOutcome::Failed(JobFailure::new(
+            "cannot capture yt-dlp stdout",
+            "internal",
+            hint,
+        ));
+    };
+    let Some(stderr_pipe) = child.stderr.take() else {
+        group.kill();
+        return JobOutcome::Failed(JobFailure::new(
+            "cannot capture yt-dlp stderr",
+            "internal",
+            hint,
+        ));
+    };
+
+    let stdout_task = tokio::spawn(async move {
+        let mut sink = String::new();
+        stdout_pipe.read_to_string(&mut sink).await.map(|_| sink)
+    });
+    let progress_job = Arc::clone(job);
+    let stderr_task = tokio::spawn(read_job_stderr(stderr_pipe, progress_job));
+
+    let limit = request.timeout.unwrap_or(config.timeout);
+    let status = tokio::select! {
+        _ = job.cancel.cancelled() => {
+            group.kill();
+            if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
+                group.disarm();
+            }
+            stdout_task.abort();
+            stderr_task.abort();
+            return JobOutcome::Cancelled;
+        }
+        waited = timeout(limit, child.wait()) => match waited {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                group.kill();
+                if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
+                    group.disarm();
+                }
+                stdout_task.abort();
+                stderr_task.abort();
+                return JobOutcome::Failed(JobFailure::new(
+                    format!("failed to wait for yt-dlp: {error}"),
+                    "internal",
+                    hint,
+                ));
+            }
+            Err(_) => {
+                group.kill();
+                if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
+                    group.disarm();
+                }
+                stdout_task.abort();
+                stderr_task.abort();
+                return JobOutcome::Failed(JobFailure::new(
+                    format!("yt-dlp timed out after {}ms", limit.as_millis()),
+                    "timeout",
+                    hint,
+                ));
+            }
+        }
+    };
+
+    // yt-dlp exited, but a grandchild may still hold the pipes open.
+    let ((stderr, stderr_stalled), _stdout) =
+        tokio::join!(drain_pipe(stderr_task), drain_pipe(stdout_task));
+    if stderr_stalled {
+        group.kill();
+    }
+    group.disarm();
+
+    if job.cancel.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+
+    let stderr = stderr.unwrap_or_default();
+    if !status.success() {
+        let failure = ytdlp_failure(&stderr, status.code(), hint);
+        return JobOutcome::Failed(JobFailure::from_api(failure, "download_failed"));
+    }
+
+    let produced = fs::read_to_string(&path_file).await.unwrap_or_default();
+    let media = nth_filepath(&produced, request.item).or_else(|| nth_filepath(&produced, 1));
+    let Some(path) = media else {
+        return JobOutcome::Failed(JobFailure::new(
+            format!("yt-dlp did not produce item {}", request.item),
+            "no_output",
+            hint,
+        ));
+    };
+    let metadata = match fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return JobOutcome::Failed(JobFailure::new(
+                "yt-dlp did not produce an output file",
+                "no_output",
+                hint,
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return JobOutcome::Failed(JobFailure::new(
+            "yt-dlp did not produce an output file",
+            "no_output",
+            hint,
+        ));
+    }
+    if metadata.len() > config.max_filesize {
+        return JobOutcome::Failed(JobFailure::new(
+            format!(
+                "output file is {} bytes, over the {} byte limit",
+                metadata.len(),
+                config.max_filesize
+            ),
+            "download_failed",
+            hint,
+        ));
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(if request.mode.is_audio() {
+            "audio"
+        } else {
+            "video"
+        })
+        .to_string();
+    let mime = if request.mode.is_audio() {
+        "audio/mp4".to_string()
+    } else {
+        mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string()
+    };
+
+    if let (Some(cache), Some(key)) = (&config.cache, cache_key.as_deref()) {
+        let _ = cache
+            .insert(key, &path, &name, &mime, metadata.len(), request.platform)
+            .await;
+    }
+
+    JobOutcome::Done(JobMedia {
+        path,
+        name,
+        mime,
+        size: metadata.len(),
+    })
+}
+
+/// Reads progress lines from yt-dlp's stderr and keeps the remaining text for
+/// error classification, bounded like synchronous downloads.
+async fn read_job_stderr(pipe: tokio::process::ChildStderr, job: Arc<Job>) -> io::Result<String> {
+    let mut lines = BufReader::new(pipe).lines();
+    let mut text = String::new();
+    while let Some(line) = lines.next_line().await? {
+        if let Some(update) = parse_progress_line(&line) {
+            let mut state = job.lock_state();
+            state.bytes = update.bytes;
+            if let Some(total) = update.total {
+                state.total_bytes = Some(total);
+            }
+            state.eta = update.eta;
+            state.progress = update
+                .percent
+                .or_else(|| {
+                    update
+                        .total
+                        .filter(|total| *total > 0)
+                        .map(|total| (update.bytes as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+                })
+                .unwrap_or(state.progress);
+        } else if text.len() < MAX_STDERR_BYTES {
+            text.push_str(line.trim_end());
+            text.push('\n');
+        }
+    }
+    Ok(truncate_to_bytes(text, MAX_STDERR_BYTES))
+}
+
+fn parse_progress_line(line: &str) -> Option<ProgressUpdate> {
+    let rest = line.trim().strip_prefix(PROGRESS_PREFIX)?;
+    let mut parts = rest.split('|');
+    let bytes = parse_amount(parts.next()?)?;
+    let total_bytes = parts.next().unwrap_or("");
+    let estimate_bytes = parts.next().unwrap_or("");
+    let eta = parse_amount(parts.next().unwrap_or(""));
+    let percent = parse_percent(parts.next().unwrap_or(""));
+    let total = parse_amount(total_bytes).or_else(|| parse_amount(estimate_bytes));
+    Some(ProgressUpdate {
+        bytes,
+        total: total.filter(|total| *total > 0),
+        eta,
+        percent,
+    })
+}
+
+fn parse_amount(value: &str) -> Option<u64> {
+    let value: f64 = value.trim().parse().ok()?;
+    (value.is_finite() && value >= 0.0).then_some(value as u64)
+}
+
+fn parse_percent(value: &str) -> Option<f64> {
+    let value = value.trim().trim_end_matches('%').trim();
+    let value: f64 = value.parse().ok()?;
+    value.is_finite().then_some(value.clamp(0.0, 100.0))
+}
+
+/// Hard-links (or copies) a cache hit into the job directory so the job keeps
+/// its own file even if the cache entry is evicted before `JOB_TTL_MS`.
+async fn adopt_cache_entry(entry: &CacheEntry, dir: &Path) -> Option<JobMedia> {
+    let name = entry.meta.name.clone();
+    if Path::new(&name).file_name().and_then(|file| file.to_str()) != Some(name.as_str()) {
+        return None;
+    }
+    let target = dir.join(&name);
+    if fs::hard_link(&entry.path, &target).await.is_err()
+        && fs::copy(&entry.path, &target).await.is_err()
+    {
+        return None;
+    }
+    let metadata = fs::metadata(&target).await.ok()?;
+    Some(JobMedia {
+        path: target,
+        name,
+        mime: entry.meta.content_type.clone(),
+        size: metadata.len(),
+    })
+}
+
+fn parse_job_id(raw: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(raw).map_err(|_| ApiError::bad_request("invalid job id"))
+}
+
+fn job_not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "job not found")
+}
+
 async fn root() -> Json<Value> {
     Json(json!({
         "message": "Hello!",
@@ -2110,12 +2912,13 @@ async fn root() -> Json<Value> {
     }))
 }
 
-async fn download_get(
-    State(config): State<Arc<Config>>,
-    method: Method,
-    headers: HeaderMap,
-    uri: Uri,
-) -> ApiResult {
+#[derive(Clone)]
+struct AppState {
+    config: Arc<Config>,
+    jobs: Arc<Jobs>,
+}
+
+fn download_request_from_query(uri: &Uri) -> Result<DownloadRequest, ApiError> {
     let params: HashMap<String, String> =
         url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .into_owned()
@@ -2138,38 +2941,27 @@ async fn download_get(
     let (url, platform) = validate_url(url, params.get("platform").map(String::as_str))?;
     let timeout = query_timeout(&params)?;
 
-    download(
-        &config,
-        DownloadRequest {
-            url,
-            platform,
-            cookies: None,
-            format: params
-                .get("format")
-                .filter(|format| !format.is_empty())
-                .cloned(),
-            mode: Mode::parse(params.get("mode").map(String::as_str))?,
-            quality: Quality::parse(params.get("quality").map(String::as_str))?,
-            container: Container::parse(params.get("container").map(String::as_str))?,
-            item: parse_item(params.get("item").map(String::as_str))?,
-            timeout,
-            inline: params.get("inline").is_some_and(|value| parse_bool(value)),
-        },
-        method,
-        headers,
-    )
-    .await
+    Ok(DownloadRequest {
+        url,
+        platform,
+        cookies: None,
+        format: params
+            .get("format")
+            .filter(|format| !format.is_empty())
+            .cloned(),
+        mode: Mode::parse(params.get("mode").map(String::as_str))?,
+        quality: Quality::parse(params.get("quality").map(String::as_str))?,
+        container: Container::parse(params.get("container").map(String::as_str))?,
+        item: parse_item(params.get("item").map(String::as_str))?,
+        timeout,
+        inline: params.get("inline").is_some_and(|value| parse_bool(value)),
+    })
 }
 
-async fn download_post(
-    State(config): State<Arc<Config>>,
-    method: Method,
-    headers: HeaderMap,
-    body: String,
-) -> ApiResult {
-    let parsed: Value = match serde_json::from_str(&body) {
+fn download_request_from_json(body: &str) -> Result<DownloadRequest, ApiError> {
+    let parsed: Value = match serde_json::from_str(body) {
         Ok(value) => value,
-        Err(_) => serde_json::from_str(&sanitize_json_escapes(&body)).map_err(|_| {
+        Err(_) => serde_json::from_str(&sanitize_json_escapes(body)).map_err(|_| {
             ApiError::bad_request("invalid JSON body (check for stray escapes in the url)")
         })?,
     };
@@ -2197,31 +2989,110 @@ async fn download_post(
         })
         .map(str::to_string);
 
-    download(
-        &config,
-        DownloadRequest {
-            url,
-            platform,
-            cookies,
-            format: object
-                .get("format")
-                .and_then(Value::as_str)
-                .filter(|format| !format.is_empty())
-                .map(str::to_string),
-            mode: Mode::parse(object.get("mode").and_then(Value::as_str))?,
-            quality: Quality::parse(object.get("quality").and_then(Value::as_str))?,
-            container: Container::parse(object.get("container").and_then(Value::as_str))?,
-            item: item_from_json(object.get("item"))?,
-            timeout,
-            inline: parse_bool_value(object.get("inline")),
-        },
+    Ok(DownloadRequest {
+        url,
+        platform,
+        cookies,
+        format: object
+            .get("format")
+            .and_then(Value::as_str)
+            .filter(|format| !format.is_empty())
+            .map(str::to_string),
+        mode: Mode::parse(object.get("mode").and_then(Value::as_str))?,
+        quality: Quality::parse(object.get("quality").and_then(Value::as_str))?,
+        container: Container::parse(object.get("container").and_then(Value::as_str))?,
+        item: item_from_json(object.get("item"))?,
+        timeout,
+        inline: parse_bool_value(object.get("inline")),
+    })
+}
+
+async fn download_get(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+) -> ApiResult {
+    let request = download_request_from_query(&uri)?;
+    download(&state.config, request, method, headers).await
+}
+
+async fn download_post(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    body: String,
+) -> ApiResult {
+    let request = download_request_from_json(&body)?;
+    download(&state.config, request, method, headers).await
+}
+
+async fn jobs_post(State(state): State<AppState>, body: String) -> ApiResult {
+    let request = download_request_from_json(&body)?;
+    let (job, position) = state.jobs.enqueue(request)?;
+    let response = json!({
+        "id": job.id.to_string(),
+        "status": job.lock_state().status.name(),
+        "position": position,
+    });
+    state.jobs.start(Arc::clone(&state.config), job);
+    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+async fn job_get(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiResult {
+    let id = parse_job_id(&id)?;
+    let snapshot = state.jobs.snapshot(id).ok_or_else(job_not_found)?;
+    Ok(Json(snapshot).into_response())
+}
+
+async fn job_delete(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiResult {
+    let id = parse_job_id(&id)?;
+    let snapshot = state.jobs.cancel(id).await?;
+    Ok(Json(snapshot).into_response())
+}
+
+async fn job_file(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> ApiResult {
+    let id = parse_job_id(&id)?;
+    let job = state.jobs.get(id).ok_or_else(job_not_found)?;
+    let (status, media, inline) = {
+        let state = job.lock_state();
+        (
+            state.status,
+            state
+                .media
+                .as_ref()
+                .map(|media| (media.path.clone(), media.name.clone(), media.mime.clone())),
+            job.request.inline,
+        )
+    };
+    if status != JobStatus::Done {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("job is {}", status.name()),
+        ));
+    }
+    let Some((path, name, mime)) = media else {
+        return Err(ApiError::internal("job file is missing"));
+    };
+    Ok(serve_file(
+        &path,
+        &name,
+        &mime,
+        job.request.platform.name(),
+        inline,
         method,
         headers,
     )
-    .await
+    .await)
 }
 
-async fn info_get(State(config): State<Arc<Config>>, uri: Uri) -> Result<Json<Value>, ApiError> {
+async fn info_get(State(state): State<AppState>, uri: Uri) -> Result<Json<Value>, ApiError> {
+    let config = &state.config;
     let params: HashMap<String, String> =
         url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .into_owned()
@@ -2245,7 +3116,7 @@ async fn info_get(State(config): State<Arc<Config>>, uri: Uri) -> Result<Json<Va
     let timeout = query_timeout(&params)?;
 
     info(
-        &config,
+        config,
         InfoRequest {
             url,
             platform,
@@ -2256,10 +3127,8 @@ async fn info_get(State(config): State<Arc<Config>>, uri: Uri) -> Result<Json<Va
     .await
 }
 
-async fn info_post(
-    State(config): State<Arc<Config>>,
-    body: String,
-) -> Result<Json<Value>, ApiError> {
+async fn info_post(State(state): State<AppState>, body: String) -> Result<Json<Value>, ApiError> {
+    let config = &state.config;
     let parsed: Value = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(_) => serde_json::from_str(&sanitize_json_escapes(&body)).map_err(|_| {
@@ -2291,7 +3160,7 @@ async fn info_post(
         .map(str::to_string);
 
     info(
-        &config,
+        config,
         InfoRequest {
             url,
             platform,
@@ -2303,10 +3172,11 @@ async fn info_post(
 }
 
 async fn cache_stats(
-    State(config): State<Arc<Config>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    authorize(&config, &headers)?;
+    let config = &state.config;
+    authorize(config, &headers)?;
     match &config.cache {
         Some(cache) => Ok(Json(cache.stats().await).into_response()),
         None => Ok(Json(json!({ "enabled": false })).into_response()),
@@ -2314,10 +3184,11 @@ async fn cache_stats(
 }
 
 async fn cache_clear(
-    State(config): State<Arc<Config>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    authorize(&config, &headers)?;
+    let config = &state.config;
+    authorize(config, &headers)?;
     match &config.cache {
         Some(cache) => {
             let (cleared, bytes) = cache.clear().await;
@@ -2339,7 +3210,8 @@ fn cookie_store_dir(config: &Config) -> Result<&Path, ApiError> {
         .ok_or_else(|| ApiError::bad_request("cookie store disabled; set IXIAN_COOKIE_DIR"))
 }
 
-async fn list_cookies(State(config): State<Arc<Config>>) -> Json<Value> {
+async fn list_cookies(State(state): State<AppState>) -> Json<Value> {
+    let config = &state.config;
     let mut cookies = Vec::with_capacity(Platform::ALL.len());
     for platform in Platform::ALL {
         let metadata = match &config.cookie_dir {
@@ -2370,14 +3242,15 @@ async fn list_cookies(State(config): State<Arc<Config>>) -> Json<Value> {
 }
 
 async fn put_cookie(
-    State(config): State<Arc<Config>>,
+    State(state): State<AppState>,
     UrlPath(platform): UrlPath<String>,
     headers: HeaderMap,
     body: String,
 ) -> ApiResult {
-    authorize(&config, &headers)?;
+    let config = &state.config;
+    authorize(config, &headers)?;
     let platform = parse_platform(&platform)?;
-    let dir = cookie_store_dir(&config)?;
+    let dir = cookie_store_dir(config)?;
     let contents = stored_cookie_contents(&body, platform)?;
     let path = cookie_path(dir, platform);
     write_cookie_file(&path, &contents)
@@ -2398,13 +3271,14 @@ async fn put_cookie(
 }
 
 async fn delete_cookie(
-    State(config): State<Arc<Config>>,
+    State(state): State<AppState>,
     UrlPath(platform): UrlPath<String>,
     headers: HeaderMap,
 ) -> ApiResult {
-    authorize(&config, &headers)?;
+    let config = &state.config;
+    authorize(config, &headers)?;
     let platform = parse_platform(&platform)?;
-    let dir = cookie_store_dir(&config)?;
+    let dir = cookie_store_dir(config)?;
     let deleted = match fs::remove_file(cookie_path(dir, platform)).await {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -2430,10 +3304,13 @@ async fn method_not_allowed() -> ApiError {
     ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }
 
-fn app(config: Arc<Config>) -> Router {
+fn app_with_jobs(config: Arc<Config>, jobs: Arc<Jobs>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/download", get(download_get).post(download_post))
+        .route("/jobs", post(jobs_post))
+        .route("/jobs/{id}", get(job_get).delete(job_delete))
+        .route("/jobs/{id}/file", get(job_file))
         .route("/info", get(info_get).post(info_post))
         .route("/cache/stats", get(cache_stats))
         .route("/cache", delete(cache_clear))
@@ -2442,7 +3319,13 @@ fn app(config: Arc<Config>) -> Router {
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(config)
+        .with_state(AppState { config, jobs })
+}
+
+fn app(config: Arc<Config>) -> Router {
+    let jobs = Arc::new(Jobs::new(&config));
+    jobs.clone().spawn_cleanup();
+    app_with_jobs(config, jobs)
 }
 
 #[tokio::main]
@@ -2936,20 +3819,21 @@ mod http_tests {
                     r#"#!/bin/sh
 set -eu
 LOG="{log_dir}"
+printf '%s\n' "$@" > "$LOG/args.txt"
 out=""
-prev=""
 jar=""
 ext="mp4"
-for arg in "$@"; do
-  case "$prev" in
-    -o) out="$arg" ;;
-    --cookies) jar="$arg" ;;
-    --merge-output-format) ext="$arg" ;;
-    --audio-format) ext="$arg" ;;
+print_file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    --cookies) jar="$2"; shift 2 ;;
+    --merge-output-format) ext="$2"; shift 2 ;;
+    --audio-format) ext="$2"; shift 2 ;;
+    --print-to-file) print_file="$3"; shift 3 ;;
+    *) shift ;;
   esac
-  prev="$arg"
 done
-printf '%s\n' "$@" > "$LOG/args.txt"
 printf 'run\n' >> "$LOG/runs.txt"
 if [ -n "$jar" ]; then cp -p "$jar" "$LOG/jar.txt"; fi
 {extra}
@@ -2963,12 +3847,14 @@ if [ -f "$LOG/items" ]; then
   i=1
   while [ "$i" -le "$n" ]; do
     printf 'item %s' "$i" > "${{prefix}}item${{i}}.${{ext}}"
+    if [ -n "$print_file" ]; then printf '%s\n' "${{prefix}}item${{i}}.${{ext}}" >> "$print_file"; fi
     printf '%s\n' "${{prefix}}item${{i}}.${{ext}}"
     i=$((i+1))
   done
   exit 0
 fi
 printf 'fake video data' > "${{prefix}}fake.${{ext}}"
+if [ -n "$print_file" ]; then printf '%s\n' "${{prefix}}fake.${{ext}}" > "$print_file"; fi
 printf '%s\n' "${{prefix}}fake.${{ext}}"
 "#
                 ),
@@ -3106,6 +3992,56 @@ printf '%s\n' "${{prefix}}fake.${{ext}}"
             concurrency: usize,
             max_filesize: u64,
         ) -> Arc<Config> {
+            self.config_full_jobs(
+                timeout,
+                info_timeout,
+                plugin_dir,
+                cookie_dir,
+                cache,
+                token,
+                concurrency,
+                max_filesize,
+                DEFAULT_MAX_QUEUE,
+                Duration::from_millis(DEFAULT_JOB_TTL_MS),
+            )
+        }
+
+        fn config_with_job_limits(
+            &self,
+            timeout: Duration,
+            plugin_dir: Option<PathBuf>,
+            concurrency: usize,
+            max_queue: usize,
+            job_ttl: Duration,
+        ) -> Arc<Config> {
+            self.config_full_jobs(
+                timeout,
+                timeout,
+                plugin_dir,
+                None,
+                None,
+                None,
+                concurrency,
+                MAX_FILESIZE,
+                max_queue,
+                job_ttl,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn config_full_jobs(
+            &self,
+            timeout: Duration,
+            info_timeout: Duration,
+            plugin_dir: Option<PathBuf>,
+            cookie_dir: Option<PathBuf>,
+            cache: Option<Cache>,
+            token: Option<String>,
+            concurrency: usize,
+            max_filesize: u64,
+            max_queue: usize,
+            job_ttl: Duration,
+        ) -> Arc<Config> {
             Arc::new(Config {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -3120,6 +4056,8 @@ printf '%s\n' "${{prefix}}fake.${{ext}}"
                 token,
                 downloads: Arc::new(Semaphore::new(concurrency)),
                 max_filesize,
+                max_queue,
+                job_ttl,
             })
         }
 
@@ -3212,6 +4150,28 @@ printf '%s\n' "${{prefix}}fake.${{ext}}"
             .to_bytes()
             .to_vec();
         (status, headers, body)
+    }
+
+    async fn job(app: &Router, id: &str) -> Value {
+        let (status, _, body) =
+            request(app.clone(), Method::GET, &format!("/jobs/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn wait_for_job(app: &Router, id: &str, predicate: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let value = job(app, id).await;
+            if predicate(&value) {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job {id} did not reach expected state: {value}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]
@@ -4390,6 +5350,289 @@ printf '%s\n' "${{prefix}}fake.${{ext}}"
             harness.runs(),
             2,
             "changed stored cookies must not reuse the cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_jobs_reports_progress_and_serves_ranges() {
+        let harness = Harness::new(
+            r#"printf 'ixian-progress|5|10|NA|2|50.0%%\n' >&2
+sleep 1
+printf 'ixian-progress|10|10|10|0|100.0%%\n' >&2"#,
+        );
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({
+            "url": "https://www.youtube.com/watch?v=abc",
+            "format": "b[ext=mp4]",
+        })
+        .to_string();
+
+        let (status, _, body) = request(app.clone(), Method::POST, "/jobs", Some(payload)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["status"], "queued");
+        assert_eq!(created["position"], 1);
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let running = wait_for_job(&app, &id, |job| job["bytes"].as_u64().unwrap_or(0) >= 5).await;
+        assert_eq!(running["status"], "running");
+        assert_eq!(running["progress"], 50.0);
+        assert_eq!(running["bytes"], 5);
+        assert_eq!(running["total_bytes"], 10);
+        assert_eq!(running["eta"], 2);
+        assert!(running["error"].is_null());
+
+        let done = wait_for_job(&app, &id, |job| job["status"] == "done").await;
+        assert_eq!(done["progress"], 100.0);
+        assert_eq!(done["bytes"], 15);
+        assert_eq!(done["total_bytes"], 15);
+        assert_eq!(done["eta"], 0);
+        assert!(done["error"].is_null());
+
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(lines.contains(&"--newline"), "{args}");
+        assert!(lines.contains(&"--progress-template"), "{args}");
+        assert!(!lines.contains(&"--print"), "{args}");
+        let index = lines
+            .iter()
+            .position(|arg| *arg == "--print-to-file")
+            .unwrap();
+        assert_eq!(lines[index + 1], "after_move:filepath");
+        assert!(args.contains("ixian-progress|%(progress.downloaded_bytes)s"));
+
+        let path = format!("/jobs/{id}/file");
+        let (status, headers, body) = request(app.clone(), Method::GET, &path, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"fake video data");
+        assert_eq!(headers[header::CONTENT_LENGTH], "15");
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(headers["x-ixian-platform"], "youtube");
+
+        let (status, headers, body) = request_with_headers(
+            app.clone(),
+            Method::GET,
+            &path,
+            None,
+            header_map(&[(header::RANGE.as_str(), "bytes=5-9")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 5-9/15");
+        assert_eq!(headers[header::CONTENT_LENGTH], "5");
+        assert_eq!(body, b"video");
+
+        let (status, headers, body) = request_with_headers(
+            app.clone(),
+            Method::GET,
+            &path,
+            None,
+            header_map(&[(header::RANGE.as_str(), "bytes=-4")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 11-14/15");
+        assert_eq!(body, b"data");
+
+        let (status, headers, body) = request(app.clone(), Method::HEAD, &path, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_LENGTH], "15");
+        assert!(body.is_empty());
+
+        let (status, headers, body) = request_with_headers(
+            app.clone(),
+            Method::GET,
+            &path,
+            None,
+            header_map(&[(header::RANGE.as_str(), "bytes=99-")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes */15");
+        assert!(body.is_empty());
+
+        let (status, _, _) =
+            request(app, Method::GET, &format!("/jobs/{}", Uuid::new_v4()), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancels_queued_and_running_jobs_and_bounds_the_queue() {
+        let harness = Harness::new("sleep 5");
+        let config = harness.config_with_job_limits(
+            Duration::from_secs(30),
+            None,
+            1,
+            1,
+            Duration::from_secs(3_600),
+        );
+        let app = app(config);
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) =
+            request(app.clone(), Method::POST, "/jobs", Some(payload.clone())).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let first: Value = serde_json::from_slice(&body).unwrap();
+        let first_id = first["id"].as_str().unwrap().to_string();
+        wait_for_job(&app, &first_id, |job| job["status"] == "running").await;
+
+        let (status, _, body) =
+            request(app.clone(), Method::POST, "/jobs", Some(payload.clone())).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let second: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["status"], "queued");
+        assert_eq!(second["position"], 1);
+        let second_id = second["id"].as_str().unwrap().to_string();
+
+        let (status, _, body) = request(app.clone(), Method::POST, "/jobs", Some(payload)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(error["error"].as_str().unwrap().contains("queue is full"));
+
+        let (status, _, body) = request(
+            app.clone(),
+            Method::DELETE,
+            &format!("/jobs/{second_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cancelled: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(cancelled["error"].is_null());
+
+        let second = wait_for_job(&app, &second_id, |job| job["status"] == "cancelled").await;
+        assert_eq!(second["position"], 0);
+
+        let (status, _, body) = request(
+            app.clone(),
+            Method::DELETE,
+            &format!("/jobs/{first_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cancelled: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_the_whole_process_group() {
+        let harness = Harness::new(
+            r#"( sleep 1; printf alive > "$LOG/alive" ) &
+echo $! > "$LOG/child.pid"
+wait"#,
+        );
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app.clone(), Method::POST, "/jobs", Some(payload)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id: Value = serde_json::from_slice(&body).unwrap();
+        let id = id["id"].as_str().unwrap().to_string();
+        wait_for_job(&app, &id, |job| job["status"] == "running").await;
+
+        let child_file = harness.logs.path().join("child.pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child_file.exists() {
+            assert!(Instant::now() < deadline, "stub did not start its child");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let (status, _, body) =
+            request(app.clone(), Method::DELETE, &format!("/jobs/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let cancelled: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        assert!(
+            !harness.logs.path().join("alive").exists(),
+            "child survived job cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn times_out_jobs_and_cleans_their_files() {
+        let harness = Harness::new("sleep 5");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({
+            "url": "https://youtu.be/abc",
+            "timeoutMs": 100,
+        })
+        .to_string();
+
+        let (status, _, body) = request(app.clone(), Method::POST, "/jobs", Some(payload)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let failed = wait_for_job(&app, &id, |job| job["status"] == "failed").await;
+        assert!(failed["error"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"));
+        assert_eq!(failed["error"]["code"], "timeout");
+        assert!(failed["error"]["hint"].is_null());
+        assert!(failed["eta"].is_null());
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+
+        let (status, _, _) = request(app, Method::GET, &format!("/jobs/{id}/file"), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cleans_up_expired_jobs() {
+        let harness = Harness::new("");
+        let config = harness.config_with_job_limits(
+            Duration::from_secs(30),
+            None,
+            1,
+            4,
+            Duration::from_millis(0),
+        );
+        let jobs = Arc::new(Jobs::new(&config));
+        let app = app_with_jobs(config, Arc::clone(&jobs));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app.clone(), Method::POST, "/jobs", Some(payload)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        wait_for_job(&app, &id, |job| job["status"] == "done").await;
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 1);
+
+        jobs.cleanup_expired();
+
+        let (status, _, _) = request(app, Method::GET, &format!("/jobs/{id}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(stdfs::read_dir(harness.tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn jobs_use_the_disk_cache() {
+        let harness = Harness::new("");
+        let cache_dir = TempDir::new().unwrap();
+        let cache = disk_cache(&cache_dir, None, Some(1024 * 1024));
+        let app = app(harness.config_with_cache(cache));
+        let payload = serde_json::json!({ "url": "https://youtu.be/job-cache" }).to_string();
+
+        let (status, _, body) =
+            request(app.clone(), Method::POST, "/jobs", Some(payload.clone())).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        wait_for_job(&app, &id, |job| job["status"] == "done").await;
+        assert_eq!(harness.runs(), 1);
+
+        let (status, _, body) = request(app, Method::POST, "/download", Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"fake video data");
+        assert_eq!(
+            harness.runs(),
+            1,
+            "the job result should populate the cache"
         );
     }
 }
