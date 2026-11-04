@@ -268,7 +268,7 @@ platform checks.
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "ytdlp_version": "2026.10.26",
   "active_jobs": 0,
   "cache_bytes": null,
