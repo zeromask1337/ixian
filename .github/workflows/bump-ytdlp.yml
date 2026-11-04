@@ -1,0 +1,75 @@
+name: Bump yt-dlp
+
+# The image pins yt-dlp for reproducible extractor behavior. This workflow turns
+# a new PyPI release into a reviewable PR instead of silently changing a floating
+# image. Set a YTDLP_BUMP_TOKEN secret (a PAT) if you want CI to run on the
+# generated PR: PRs opened with GITHUB_TOKEN do not trigger other workflows.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-ytdlp
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Check PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare pinned and latest versions
+        id: check
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsS https://pypi.org/pypi/yt-dlp/json | jq -r .info.version)
+          current=$(sed -n 's/^ARG YTDLP_VERSION=//p' Dockerfile | head -n1)
+          if [ -z "$current" ]; then
+            echo "Dockerfile has no ARG YTDLP_VERSION" >&2
+            exit 1
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$current" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "yt-dlp is up to date ($current)"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "yt-dlp $current -> $latest"
+          fi
+
+      - name: Open bump PR
+        if: steps.check.outputs.changed == 'true'
+        env:
+          # Optional PAT: a GITHUB_TOKEN-authored PR does not trigger ci.yml.
+          GH_TOKEN: ${{ secrets.YTDLP_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.check.outputs.latest }}
+          CURRENT: ${{ steps.check.outputs.current }}
+        run: |
+          set -euo pipefail
+          branch="chore/bump-ytdlp-${VERSION}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "branch $branch already exists; skipping"
+            exit 0
+          fi
+          sed -i "s/^ARG YTDLP_VERSION=.*/ARG YTDLP_VERSION=${VERSION}/" Dockerfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "chore(docker): bump yt-dlp to ${VERSION}"
+          git push -u origin "$branch"
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "Automated PyPI check: yt-dlp \`${CURRENT}\` -> \`${VERSION}\`." \
+            "yt-dlp is pinned in the Dockerfile so extractor behavior does not change between builds of the same source. Merging this PR makes the next tagged release use the new version; cut a release so **Publish image** builds and publishes it." \
+            "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+          gh pr create \
+            --base master \
+            --head "$branch" \
+            --title "chore(docker): bump yt-dlp to ${VERSION}" \
+            --body "$body"

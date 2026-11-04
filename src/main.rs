@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -34,7 +34,12 @@ use tokio::{
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use tower::ServiceExt;
-use tower_http::services::ServeFile;
+use tower_http::{
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    services::ServeFile,
+    trace::{DefaultOnResponse, TraceLayer},
+};
+use tracing::{info, info_span, warn, Level};
 use url::Url;
 use uuid::Uuid;
 
@@ -53,6 +58,11 @@ const GET_COOKIE_PARAMS: [&str; 4] = [
     "tiktok_cookies",
 ];
 const STREAM_CHUNK: usize = 64 * 1024;
+const TEMP_PREFIX: &str = "ixian-";
+const REAP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const ORPHAN_AGE: Duration = Duration::from_secs(60 * 60);
+const REQUEST_ID_HEADER: &str = "x-request-id";
+const YTDLP_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_CONCURRENT: usize = 4;
@@ -125,6 +135,157 @@ impl Platform {
 
     fn from_name(name: &str) -> Option<Platform> {
         Platform::ALL.into_iter().find(|p| p.name() == name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EmbedOptions {
+    subs: bool,
+    thumbnail: bool,
+    metadata: bool,
+}
+
+impl EmbedOptions {
+    /// Parses `subs,thumbnail,metadata`; an empty value means no embeds.
+    fn parse(value: &str) -> Result<Self, ApiError> {
+        let mut options = Self::default();
+        for item in value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            match item {
+                "subs" => options.subs = true,
+                "thumbnail" => options.thumbnail = true,
+                "metadata" => options.metadata = true,
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "unknown embed '{other}' (expected: subs, thumbnail, metadata)"
+                    )))
+                }
+            }
+        }
+        Ok(options)
+    }
+
+    fn from_json(value: Option<&Value>) -> Result<Self, ApiError> {
+        match value {
+            None | Some(Value::Null) => Ok(Self::default()),
+            Some(Value::String(text)) => Self::parse(text),
+            Some(Value::Array(items)) => {
+                let mut options = Self::default();
+                for item in items {
+                    let text = item.as_str().ok_or_else(|| {
+                        ApiError::bad_request("'embed' array entries must be strings")
+                    })?;
+                    options = options.merge(Self::parse(text)?);
+                }
+                Ok(options)
+            }
+            Some(_) => Err(ApiError::bad_request(
+                "'embed' must be a string or an array of strings",
+            )),
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            subs: self.subs || other.subs,
+            thumbnail: self.thumbnail || other.thumbnail,
+            metadata: self.metadata || other.metadata,
+        }
+    }
+
+    fn tag(self) -> String {
+        let mut tag = String::new();
+        if self.subs {
+            tag.push('s');
+        }
+        if self.thumbnail {
+            tag.push('t');
+        }
+        if self.metadata {
+            tag.push('m');
+        }
+        if tag.is_empty() {
+            tag.push('-');
+        }
+        tag
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SponsorBlock {
+    #[default]
+    Off,
+    Remove,
+    Mark,
+}
+
+impl SponsorBlock {
+    fn parse(value: &str) -> Result<Self, ApiError> {
+        match value.trim() {
+            "" | "off" | "none" => Ok(Self::Off),
+            "remove" => Ok(Self::Remove),
+            "mark" => Ok(Self::Mark),
+            other => Err(ApiError::bad_request(format!(
+                "unknown sponsorblock '{other}' (expected: remove, mark)"
+            ))),
+        }
+    }
+
+    fn from_json(value: Option<&Value>) -> Result<Self, ApiError> {
+        match value {
+            None | Some(Value::Null) => Ok(Self::Off),
+            Some(Value::String(text)) => Self::parse(text),
+            Some(_) => Err(ApiError::bad_request(
+                "'sponsorblock' must be a string (remove or mark)",
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Remove => "remove",
+            Self::Mark => "mark",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Compatibility {
+    #[default]
+    Off,
+    Quicktime,
+}
+
+impl Compatibility {
+    fn parse(value: &str) -> Result<Self, ApiError> {
+        match value.trim() {
+            "" | "off" | "none" => Ok(Self::Off),
+            "quicktime" => Ok(Self::Quicktime),
+            other => Err(ApiError::bad_request(format!(
+                "unknown compatibility '{other}' (expected: quicktime)"
+            ))),
+        }
+    }
+
+    fn from_json(value: Option<&Value>) -> Result<Self, ApiError> {
+        match value {
+            None | Some(Value::Null) => Ok(Self::Off),
+            Some(Value::String(text)) => Self::parse(text),
+            Some(_) => Err(ApiError::bad_request(
+                "'compatibility' must be a string (quicktime)",
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Quicktime => "quicktime",
+        }
     }
 }
 
@@ -312,6 +473,43 @@ struct Config {
     max_filesize: u64,
     max_queue: usize,
     job_ttl: Duration,
+    ffmpeg: String,
+    ffprobe: String,
+    shutdown_grace: Duration,
+    started: Instant,
+    shutdown: CancellationToken,
+    active: AtomicU64,
+    dirs: Arc<DirRegistry>,
+}
+
+/// Temp directories that belong to in-flight work, so the orphan reaper never
+/// deletes a download or job that is still writing.
+#[derive(Default)]
+struct DirRegistry {
+    active: StdMutex<HashSet<PathBuf>>,
+}
+
+impl DirRegistry {
+    fn register(&self, dir: &Path) {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(dir.to_path_buf());
+    }
+
+    fn unregister(&self, dir: &Path) {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(dir);
+    }
+
+    fn snapshot(&self) -> HashSet<PathBuf> {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 impl Config {
@@ -386,6 +584,12 @@ impl Config {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let ffmpeg = non_empty(env::var("FFMPEG_PATH").ok()).unwrap_or_else(|| "ffmpeg".into());
+        let ffprobe = non_empty(env::var("FFPROBE_PATH").ok()).unwrap_or_else(|| "ffprobe".into());
+        let shutdown_grace = env::var("IXIAN_SHUTDOWN_GRACE_MS")
+            .ok()
+            .and_then(|v| parse_ms(&v))
+            .unwrap_or_else(|| Duration::from_secs(15));
 
         Self {
             host,
@@ -403,6 +607,13 @@ impl Config {
             max_filesize: MAX_FILESIZE,
             max_queue,
             job_ttl,
+            ffmpeg,
+            ffprobe,
+            shutdown_grace,
+            started: Instant::now(),
+            shutdown: CancellationToken::new(),
+            active: AtomicU64::new(0),
+            dirs: Arc::new(DirRegistry::default()),
         }
     }
 }
@@ -1436,6 +1647,186 @@ fn sanitize_json_escapes(text: &str) -> String {
     out
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Codecs {
+    video: Option<String>,
+    audio: Option<String>,
+}
+
+/// Reads the first video/audio codec names. `None` means ffprobe is unavailable or the output is unreadable.
+async fn probe_codecs(config: &Config, media: &Path) -> Option<Codecs> {
+    let output = timeout(
+        Duration::from_secs(30),
+        Command::new(&config.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name",
+                "-of",
+                "json",
+            ])
+            .arg(media)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let mut codecs = Codecs::default();
+    for stream in parsed.get("streams")?.as_array()? {
+        let kind = stream.get("codec_type").and_then(Value::as_str);
+        let name = stream
+            .get("codec_name")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        match kind {
+            Some("video") if codecs.video.is_none() => codecs.video = name,
+            Some("audio") if codecs.audio.is_none() => codecs.audio = name,
+            _ => {}
+        }
+    }
+    Some(codecs)
+}
+
+/// Guarantees an H.264/AAC MP4: remuxes when the codecs already qualify, otherwise re-encodes.
+async fn ensure_quicktime(config: &Config, media: &Path) -> Result<PathBuf, ApiError> {
+    let codecs = probe_codecs(config, media).await;
+    let video = codecs.as_ref().and_then(|codecs| codecs.video.as_deref());
+    let audio = codecs.as_ref().and_then(|codecs| codecs.audio.as_deref());
+    let compatible = video == Some("h264") && audio.is_none_or(|codec| codec == "aac");
+    let extension = media
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if compatible && matches!(extension.as_str(), "mp4" | "m4v") {
+        return Ok(media.to_path_buf());
+    }
+
+    let output = quicktime_output(media);
+    let mut cmd = Command::new(&config.ffmpeg);
+    cmd.args(["-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(media);
+    if compatible {
+        cmd.args(["-c", "copy"]);
+    } else {
+        cmd.args([
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a",
+            "aac", "-b:a", "192k",
+        ]);
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(&output);
+    run_media_command(config, cmd, &output).await?;
+    info!(
+        from = %media.display(),
+        to = %output.display(),
+        remux = compatible,
+        "converted for QuickTime"
+    );
+    Ok(output)
+}
+
+fn quicktime_output(media: &Path) -> PathBuf {
+    let stem = media
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("video");
+    let candidate = media.with_file_name(format!("{stem}.mp4"));
+    if candidate == media {
+        media.with_file_name(format!("{stem} [quicktime].mp4"))
+    } else {
+        candidate
+    }
+}
+
+async fn run_media_command(
+    config: &Config,
+    mut cmd: Command,
+    output: &Path,
+) -> Result<(), ApiError> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("failed to run ffmpeg: {error}")))?;
+    let mut group = ProcessGroup::new(child.id());
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| ApiError::internal("cannot capture ffmpeg stderr"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut text = String::new();
+        stderr_pipe.read_to_string(&mut text).await.map(|_| text)
+    });
+
+    let waited = tokio::select! {
+        result = timeout(config.timeout, child.wait()) => Some(result),
+        _ = config.shutdown.cancelled() => None,
+    };
+    let status = match waited {
+        Some(Ok(Ok(status))) => status,
+        Some(Ok(Err(error))) => {
+            group.kill();
+            stderr_task.abort();
+            return Err(ApiError::internal(format!(
+                "failed to wait for ffmpeg: {error}"
+            )));
+        }
+        Some(Err(_)) => {
+            group.kill();
+            let _ = timeout(KILL_TIMEOUT, child.wait()).await;
+            stderr_task.abort();
+            return Err(ApiError::classified(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("ffmpeg timed out after {}ms", config.timeout.as_millis()),
+            ));
+        }
+        None => {
+            group.kill();
+            let _ = timeout(KILL_TIMEOUT, child.wait()).await;
+            stderr_task.abort();
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server shutting down",
+            ));
+        }
+    };
+    group.disarm();
+
+    let stderr = stderr_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if !status.success() {
+        let detail = if stderr.trim().is_empty() {
+            format!("ffmpeg exited with code {:?}", status.code())
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(ApiError::bad_gateway(
+            format!("quicktime conversion failed: {detail}"),
+            None,
+        ));
+    }
+    if !output.is_file() {
+        return Err(ApiError::internal("ffmpeg did not produce an output file"));
+    }
+    Ok(())
+}
+
 struct DownloadRequest {
     url: String,
     platform: Platform,
@@ -1447,17 +1838,23 @@ struct DownloadRequest {
     item: usize,
     timeout: Option<Duration>,
     inline: bool,
+    embed: EmbedOptions,
+    sponsorblock: SponsorBlock,
+    compatibility: Compatibility,
 }
 
 impl DownloadRequest {
     /// Cache partition for the output shape. `format` is hashed separately.
     fn cache_variant(&self) -> String {
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             self.mode.name(),
             self.quality.name(),
             self.container.name(),
-            self.item
+            self.item,
+            self.embed.tag(),
+            self.sponsorblock.name(),
+            self.compatibility.name(),
         )
     }
 }
@@ -1583,17 +1980,39 @@ async fn drain_pipe(handle: tokio::task::JoinHandle<io::Result<String>>) -> (Opt
 /// Removes the per-download temp directory (media, cookie jar, yt-dlp fragments).
 struct Cleanup {
     dir: PathBuf,
+    dirs: Arc<DirRegistry>,
 }
 
 impl Cleanup {
-    fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    fn new(config: &Config, dir: PathBuf) -> Self {
+        config.dirs.register(&dir);
+        Self {
+            dir,
+            dirs: Arc::clone(&config.dirs),
+        }
     }
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        self.dirs.unregister(&self.dir);
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Counts in-flight downloads for `/healthz`.
+struct ActiveGuard<'a>(&'a AtomicU64);
+
+impl<'a> ActiveGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1624,7 +2043,11 @@ struct YtdlpOutput {
 
 /// Runs yt-dlp in its own process group with bounded pipe capture and a hard
 /// timeout. A non-zero exit is returned as data so callers can classify stderr.
-async fn run_ytdlp(mut command: Command, limit: Duration) -> Result<YtdlpOutput, ApiError> {
+async fn run_ytdlp(
+    config: &Config,
+    mut command: Command,
+    limit: Duration,
+) -> Result<YtdlpOutput, ApiError> {
     #[cfg(unix)]
     command.process_group(0);
     command
@@ -1632,6 +2055,13 @@ async fn run_ytdlp(mut command: Command, limit: Duration) -> Result<YtdlpOutput,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    if config.shutdown.is_cancelled() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down",
+        ));
+    }
 
     let mut child = command.spawn().map_err(|error| {
         ApiError::bad_gateway(
@@ -1662,16 +2092,20 @@ async fn run_ytdlp(mut command: Command, limit: Duration) -> Result<YtdlpOutput,
         })
     });
 
-    let status = match timeout(limit, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
+    let waited = tokio::select! {
+        result = timeout(limit, child.wait()) => Some(result),
+        _ = config.shutdown.cancelled() => None,
+    };
+    let status = match waited {
+        Some(Ok(Ok(status))) => status,
+        Some(Ok(Err(error))) => {
             group.kill();
             return Err(ApiError::bad_gateway(
                 format!("failed to wait for yt-dlp: {error}"),
                 Some(hint_for(StatusCode::BAD_GATEWAY)),
             ));
         }
-        Err(_) => {
+        Some(Err(_)) => {
             group.kill();
             if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
                 group.disarm();
@@ -1682,6 +2116,16 @@ async fn run_ytdlp(mut command: Command, limit: Duration) -> Result<YtdlpOutput,
             return Err(ApiError::classified(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("yt-dlp timed out after {}ms", limit.as_millis()),
+            ));
+        }
+        None => {
+            group.kill();
+            let _ = timeout(KILL_TIMEOUT, child.wait()).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server shutting down",
             ));
         }
     };
@@ -1811,6 +2255,24 @@ fn download_command(
     if let Some(plugin_dir) = &config.plugin_dir {
         cmd.arg("--plugin-dirs").arg(plugin_dir);
     }
+    if request.embed.subs {
+        cmd.arg("--embed-subs");
+    }
+    if request.embed.thumbnail {
+        cmd.arg("--embed-thumbnail");
+    }
+    if request.embed.metadata {
+        cmd.arg("--embed-metadata");
+    }
+    match request.sponsorblock {
+        SponsorBlock::Off => {}
+        SponsorBlock::Remove => {
+            cmd.args(["--sponsorblock-remove", "all"]);
+        }
+        SponsorBlock::Mark => {
+            cmd.args(["--sponsorblock-mark", "all"]);
+        }
+    }
     if let Some(jar) = &prepared.jar {
         cmd.arg("--cookies").arg(jar);
     }
@@ -1820,6 +2282,13 @@ fn download_command(
 }
 
 async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedMedia, ApiError> {
+    if config.shutdown.is_cancelled() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down",
+        ));
+    }
+    let _active = ActiveGuard::new(&config.active);
     let platform = request.platform;
     let permit = config.downloads.clone().try_acquire_owned().map_err(|_| {
         ApiError::too_many_requests(format!(
@@ -1830,14 +2299,14 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
     let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
     create_private_dir(&dir)
         .map_err(|error| ApiError::internal(format!("cannot create temp directory: {error}")))?;
-    let cleanup = Cleanup::new(dir.clone());
+    let cleanup = Cleanup::new(config, dir.clone());
     let prepared = prepare_download(config, request, &dir).await?;
     let hint = prepared.hint;
 
     let cmd = download_command(config, request, &prepared, &dir, false);
 
     let limit = request.timeout.unwrap_or(config.timeout);
-    let output = run_ytdlp(cmd, limit).await?;
+    let output = run_ytdlp(config, cmd, limit).await?;
     if !output.success {
         return Err(ytdlp_failure(&output.stderr, output.status_code, hint));
     }
@@ -1853,6 +2322,12 @@ async fn fetch(config: &Config, request: &DownloadRequest) -> Result<DownloadedM
                 hint,
             )
         })?;
+
+    let media = if request.compatibility == Compatibility::Quicktime {
+        ensure_quicktime(config, &media).await?
+    } else {
+        media
+    };
 
     let metadata = fs::metadata(&media)
         .await
@@ -1936,7 +2411,7 @@ async fn info(config: &Config, request: InfoRequest) -> Result<Json<Value>, ApiE
     create_private_dir(&dir)
         .map_err(|error| ApiError::internal(format!("cannot create temp directory: {error}")))?;
     let jar = dir.join("cookies.txt");
-    let _cleanup = Cleanup::new(dir.clone());
+    let _cleanup = Cleanup::new(config, dir.clone());
     if let Some(cookies) = cookies.as_deref() {
         let contents = cookie_file(cookies, platform);
         if contents.len() > MAX_STORED_COOKIE_BYTES {
@@ -1968,7 +2443,7 @@ async fn info(config: &Config, request: InfoRequest) -> Result<Json<Value>, ApiE
     cmd.arg("--").arg(&url);
 
     let limit = request_timeout.unwrap_or(config.info_timeout);
-    let output = run_ytdlp(cmd, limit).await?;
+    let output = run_ytdlp(config, cmd, limit).await?;
     if !output.success {
         return Err(ytdlp_failure(&output.stderr, output.status_code, hint));
     }
@@ -2033,6 +2508,12 @@ async fn download(
     method: Method,
     headers: HeaderMap,
 ) -> ApiResult {
+    if config.shutdown.is_cancelled() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down",
+        ));
+    }
     request.url = request.url.replace('\\', "");
     let Some(cache) = &config.cache else {
         let media = fetch(config, &request).await?;
@@ -2345,10 +2826,11 @@ struct Jobs {
     inner: StdMutex<JobsInner>,
     max_queue: usize,
     ttl: Duration,
+    config: Arc<Config>,
 }
 
 impl Jobs {
-    fn new(config: &Config) -> Self {
+    fn new(config: Arc<Config>) -> Self {
         Self {
             inner: StdMutex::new(JobsInner {
                 jobs: HashMap::new(),
@@ -2356,6 +2838,7 @@ impl Jobs {
             }),
             max_queue: config.max_queue.max(1),
             ttl: config.job_ttl,
+            config,
         }
     }
 
@@ -2396,6 +2879,10 @@ impl Jobs {
                 Err(_) => return,
             },
             _ = job.cancel.cancelled() => {
+                self.finish(&job, JobOutcome::Cancelled).await;
+                return;
+            }
+            _ = config.shutdown.cancelled() => {
                 self.finish(&job, JobOutcome::Cancelled).await;
                 return;
             }
@@ -2465,6 +2952,7 @@ impl Jobs {
         };
 
         if let Some(dir) = cleanup_dir {
+            self.config.dirs.unregister(&dir);
             let _ = fs::remove_dir_all(dir).await;
         }
         if let Some(dir) = done_dir {
@@ -2565,6 +3053,7 @@ impl Jobs {
             }
         }
         for dir in dirs {
+            self.config.dirs.unregister(&dir);
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -2599,6 +3088,10 @@ struct ProgressUpdate {
 /// on cancellation or timeout. The job owns its temp directory, so the media
 /// survives `fetch`-style cleanup until the job expires.
 async fn run_job(config: &Config, job: &Arc<Job>) -> JobOutcome {
+    if config.shutdown.is_cancelled() {
+        return JobOutcome::Cancelled;
+    }
+    let _active = ActiveGuard::new(&config.active);
     let request = &job.request;
     let dir = config.tmp.join(format!("ixian-{}", Uuid::new_v4()));
     if let Err(error) = create_private_dir(&dir) {
@@ -2608,8 +3101,9 @@ async fn run_job(config: &Config, job: &Arc<Job>) -> JobOutcome {
             None,
         ));
     }
+    config.dirs.register(&dir);
     job.lock_state().dir = Some(dir.clone());
-    if job.cancel.is_cancelled() {
+    if job.cancel.is_cancelled() || config.shutdown.is_cancelled() {
         return JobOutcome::Cancelled;
     }
 
@@ -2699,6 +3193,15 @@ async fn run_job(config: &Config, job: &Arc<Job>) -> JobOutcome {
             stderr_task.abort();
             return JobOutcome::Cancelled;
         }
+        _ = config.shutdown.cancelled() => {
+            group.kill();
+            if timeout(KILL_TIMEOUT, child.wait()).await.is_ok() {
+                group.disarm();
+            }
+            stdout_task.abort();
+            stderr_task.abort();
+            return JobOutcome::Cancelled;
+        }
         waited = timeout(limit, child.wait()) => match waited {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
@@ -2738,7 +3241,7 @@ async fn run_job(config: &Config, job: &Arc<Job>) -> JobOutcome {
     }
     group.disarm();
 
-    if job.cancel.is_cancelled() {
+    if job.cancel.is_cancelled() || config.shutdown.is_cancelled() {
         return JobOutcome::Cancelled;
     }
 
@@ -2756,6 +3259,16 @@ async fn run_job(config: &Config, job: &Arc<Job>) -> JobOutcome {
             "no_output",
             hint,
         ));
+    };
+    let path = if request.compatibility == Compatibility::Quicktime {
+        match ensure_quicktime(config, &path).await {
+            Ok(path) => path,
+            Err(error) => {
+                return JobOutcome::Failed(JobFailure::from_api(error, "download_failed"))
+            }
+        }
+    } else {
+        path
     };
     let metadata = match fs::metadata(&path).await {
         Ok(metadata) => metadata,
@@ -2955,6 +3468,21 @@ fn download_request_from_query(uri: &Uri) -> Result<DownloadRequest, ApiError> {
         item: parse_item(params.get("item").map(String::as_str))?,
         timeout,
         inline: params.get("inline").is_some_and(|value| parse_bool(value)),
+        embed: params
+            .get("embed")
+            .map(|value| EmbedOptions::parse(value))
+            .transpose()?
+            .unwrap_or_default(),
+        sponsorblock: params
+            .get("sponsorblock")
+            .map(|value| SponsorBlock::parse(value))
+            .transpose()?
+            .unwrap_or_default(),
+        compatibility: params
+            .get("compatibility")
+            .map(|value| Compatibility::parse(value))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -3004,6 +3532,9 @@ fn download_request_from_json(body: &str) -> Result<DownloadRequest, ApiError> {
         item: item_from_json(object.get("item"))?,
         timeout,
         inline: parse_bool_value(object.get("inline")),
+        embed: EmbedOptions::from_json(object.get("embed"))?,
+        sponsorblock: SponsorBlock::from_json(object.get("sponsorblock"))?,
+        compatibility: Compatibility::from_json(object.get("compatibility"))?,
     })
 }
 
@@ -3296,6 +3827,181 @@ async fn delete_cookie(
     .into_response())
 }
 
+async fn healthz(State(state): State<AppState>) -> Json<Value> {
+    let config = &state.config;
+    let cache_bytes = match &config.cache {
+        Some(cache) => Some(cache.stats().await.bytes),
+        None => None,
+    };
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "ytdlp_version": ytdlp_version(config).await,
+        "active_jobs": config.active.load(Ordering::Relaxed),
+        "cache_bytes": cache_bytes,
+        "disk_free_bytes": disk_free_bytes(&config.tmp),
+        "uptime_seconds": config.started.elapsed().as_secs(),
+    }))
+}
+
+async fn ytdlp_version(config: &Config) -> Option<String> {
+    let output = timeout(
+        YTDLP_VERSION_TIMEOUT,
+        Command::new(&config.ytdlp)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!version.is_empty()).then_some(version)
+}
+
+#[cfg(unix)]
+fn disk_free_bytes(path: &Path) -> Option<u64> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    // statvfs field widths differ between macOS and Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let total = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
+    Some(total)
+}
+
+#[cfg(not(unix))]
+fn disk_free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Deletes `ixian-*` directories under `root` that are not active. `older_than: None` reaps every
+/// orphan (boot), `Some(age)` only directories untouched for that long (hourly sweep).
+async fn reap_orphans(
+    root: &Path,
+    active: &HashSet<PathBuf>,
+    older_than: Option<Duration>,
+) -> usize {
+    let mut removed = 0;
+    let Ok(mut entries) = fs::read_dir(root).await else {
+        return 0;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(TEMP_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        if active.contains(&path) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if let Some(age) = older_than {
+            let old = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= age);
+            if !old {
+                continue;
+            }
+        }
+        if fs::remove_dir_all(&path).await.is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+async fn boot_reap(config: &Config) {
+    let removed = reap_orphans(&config.tmp, &protected_dirs(config), None).await;
+    if removed > 0 {
+        info!(removed, "reaped orphan temp dirs at boot");
+    }
+}
+
+/// Active download/job directories plus the disk cache, which must never be reaped.
+fn protected_dirs(config: &Config) -> HashSet<PathBuf> {
+    let mut dirs = config.dirs.snapshot();
+    if let Some(cache) = &config.cache {
+        dirs.insert(cache.dir.clone());
+    }
+    dirs
+}
+
+fn spawn_reaper(config: Arc<Config>) {
+    tokio::spawn(async move {
+        let mut ticker = interval(REAP_INTERVAL);
+        ticker.tick().await; // the boot sweep already ran
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let removed = reap_orphans(
+                        &config.tmp,
+                        &protected_dirs(&config),
+                        Some(ORPHAN_AGE),
+                    )
+                    .await;
+                    if removed > 0 {
+                        info!(removed, "reaped orphan temp dirs");
+                    }
+                }
+                _ = config.shutdown.cancelled() => break,
+            }
+        }
+    });
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(%error, "cannot listen for ctrl-c");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                warn!(%error, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 async fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not found")
 }
@@ -3307,6 +4013,7 @@ async fn method_not_allowed() -> ApiError {
 fn app_with_jobs(config: Arc<Config>, jobs: Arc<Jobs>) -> Router {
     Router::new()
         .route("/", get(root))
+        .route("/healthz", get(healthz))
         .route("/download", get(download_get).post(download_post))
         .route("/jobs", post(jobs_post))
         .route("/jobs/{id}", get(job_get).delete(job_delete))
@@ -3319,27 +4026,87 @@ fn app_with_jobs(config: Arc<Config>, jobs: Arc<Jobs>) -> Router {
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<Body>| {
+                    let request_id = request
+                        .headers()
+                        .get(REQUEST_ID_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("-");
+                    info_span!(
+                        "http",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        request_id = %request_id
+                    )
+                })
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .with_state(AppState { config, jobs })
 }
 
+#[cfg(test)]
 fn app(config: Arc<Config>) -> Router {
-    let jobs = Arc::new(Jobs::new(&config));
+    let jobs = Arc::new(Jobs::new(Arc::clone(&config)));
     jobs.clone().spawn_cleanup();
     app_with_jobs(config, jobs)
 }
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "ixian=info,tower_http=info".into()),
+        )
+        .init();
+
     let config = Arc::new(Config::from_env());
+    let jobs = Arc::new(Jobs::new(Arc::clone(&config)));
+    jobs.clone().spawn_cleanup();
     let listener = TcpListener::bind((config.host.as_str(), config.port))
         .await
         .unwrap_or_else(|error| {
             panic!("cannot listen on {}:{}: {error}", config.host, config.port)
         });
-    println!("ixian on http://{}:{}", config.host, config.port);
-    axum::serve(listener, app(config))
-        .await
-        .unwrap_or_else(|error| panic!("server error: {error}"));
+    boot_reap(&config).await;
+    spawn_reaper(Arc::clone(&config));
+    info!(
+        address = %format!("{}:{}", config.host, config.port),
+        version = env!("CARGO_PKG_VERSION"),
+        "ixian listening"
+    );
+
+    let draining = Arc::new(tokio::sync::Notify::new());
+    let shutdown = {
+        let config = Arc::clone(&config);
+        let draining = Arc::clone(&draining);
+        async move {
+            shutdown_signal().await;
+            config.shutdown.cancel();
+            draining.notify_one();
+        }
+    };
+    let server =
+        axum::serve(listener, app_with_jobs(config.clone(), jobs)).with_graceful_shutdown(shutdown);
+    let grace = config.shutdown_grace;
+    tokio::select! {
+        result = server => {
+            if let Err(error) = result {
+                panic!("server error: {error}");
+            }
+            info!("server stopped");
+        }
+        _ = async {
+            draining.notified().await;
+            tokio::time::sleep(grace).await;
+        } => {
+            warn!(grace_ms = grace.as_millis(), "shutdown grace period expired");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3790,6 +4557,121 @@ mod tests {
         assert!(!parse_bool("0"));
         assert!(!parse_bool("false"));
     }
+
+    #[test]
+    fn parses_embed_options() {
+        assert_eq!(EmbedOptions::parse("").unwrap(), EmbedOptions::default());
+        assert_eq!(
+            EmbedOptions::parse("subs, thumbnail ,metadata").unwrap(),
+            EmbedOptions {
+                subs: true,
+                thumbnail: true,
+                metadata: true,
+            }
+        );
+        assert_eq!(
+            EmbedOptions::parse("metadata").unwrap(),
+            EmbedOptions {
+                metadata: true,
+                ..EmbedOptions::default()
+            }
+        );
+        let error = EmbedOptions::parse("chapters").unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("unknown embed"));
+
+        let json = json!(["subs", "metadata"]);
+        assert_eq!(
+            EmbedOptions::from_json(Some(&json)).unwrap(),
+            EmbedOptions {
+                subs: true,
+                metadata: true,
+                ..EmbedOptions::default()
+            }
+        );
+        assert!(EmbedOptions::from_json(Some(&json!(true))).is_err());
+    }
+
+    #[test]
+    fn parses_sponsorblock_and_compatibility() {
+        assert_eq!(SponsorBlock::parse("").unwrap(), SponsorBlock::Off);
+        assert_eq!(SponsorBlock::parse("off").unwrap(), SponsorBlock::Off);
+        assert_eq!(SponsorBlock::parse("remove").unwrap(), SponsorBlock::Remove);
+        assert_eq!(SponsorBlock::parse("mark").unwrap(), SponsorBlock::Mark);
+        let error = SponsorBlock::parse("delete").unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("unknown sponsorblock"));
+
+        assert_eq!(
+            Compatibility::parse("quicktime").unwrap(),
+            Compatibility::Quicktime
+        );
+        assert_eq!(Compatibility::parse("none").unwrap(), Compatibility::Off);
+        let error = Compatibility::parse("windows").unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("unknown compatibility"));
+
+        assert_eq!(
+            SponsorBlock::from_json(Some(&json!("mark"))).unwrap(),
+            SponsorBlock::Mark
+        );
+        assert_eq!(
+            Compatibility::from_json(Some(&json!("quicktime"))).unwrap(),
+            Compatibility::Quicktime
+        );
+        assert!(Compatibility::from_json(Some(&json!(1))).is_err());
+    }
+
+    #[test]
+    fn names_quicktime_outputs() {
+        assert_eq!(
+            quicktime_output(Path::new("/tmp/clip [id].webm")),
+            PathBuf::from("/tmp/clip [id].mp4")
+        );
+        assert_eq!(
+            quicktime_output(Path::new("/tmp/clip [id].mp4")),
+            PathBuf::from("/tmp/clip [id] [quicktime].mp4")
+        );
+    }
+
+    #[tokio::test]
+    async fn reaps_orphan_temp_dirs_only() {
+        let root = tempfile::TempDir::new().unwrap();
+        let orphan = root.path().join("ixian-orphan");
+        let active = root.path().join("ixian-active");
+        let other = root.path().join("downloads");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(orphan.join("leftover.part"), b"x").unwrap();
+        std::fs::write(root.path().join("ixian-file"), b"x").unwrap();
+
+        let active: HashSet<PathBuf> = HashSet::from([active.clone()]);
+        assert_eq!(reap_orphans(root.path(), &active, None).await, 1);
+        assert!(!orphan.exists());
+        assert!(active.iter().all(|path| path.exists()));
+        assert!(other.exists());
+        assert!(root.path().join("ixian-file").exists());
+    }
+
+    #[tokio::test]
+    async fn hourly_reap_spares_fresh_temp_dirs() {
+        let root = tempfile::TempDir::new().unwrap();
+        let old = root.path().join("ixian-old");
+        let fresh = root.path().join("ixian-fresh");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+
+        let removed = reap_orphans(root.path(), &HashSet::new(), Some(ORPHAN_AGE)).await;
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+    }
 }
 
 #[cfg(test)]
@@ -3818,6 +4700,10 @@ mod http_tests {
                 format!(
                     r#"#!/bin/sh
 set -eu
+if [ "$1" = "--version" ]; then
+  printf 'v2026.10.26\n'
+  exit 0
+fi
 LOG="{log_dir}"
 printf '%s\n' "$@" > "$LOG/args.txt"
 out=""
@@ -4058,6 +4944,13 @@ printf '%s\n' "${{prefix}}fake.${{ext}}"
                 max_filesize,
                 max_queue,
                 job_ttl,
+                ffmpeg: "ffmpeg".into(),
+                ffprobe: "ffprobe".into(),
+                shutdown_grace: Duration::from_secs(1),
+                started: Instant::now(),
+                shutdown: CancellationToken::new(),
+                active: AtomicU64::new(0),
+                dirs: Arc::new(DirRegistry::default()),
             })
         }
 
@@ -5592,7 +6485,7 @@ wait"#,
             4,
             Duration::from_millis(0),
         );
-        let jobs = Arc::new(Jobs::new(&config));
+        let jobs = Arc::new(Jobs::new(Arc::clone(&config)));
         let app = app_with_jobs(config, Arc::clone(&jobs));
         let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
 
@@ -5634,5 +6527,55 @@ wait"#,
             1,
             "the job result should populate the cache"
         );
+    }
+
+    #[tokio::test]
+    async fn reports_health_with_ytdlp_version() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+
+        let (status, headers, body) = request(app, Method::GET, "/healthz", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_TYPE].to_str().unwrap(),
+            "application/json"
+        );
+        assert!(headers.contains_key(REQUEST_ID_HEADER));
+        let health: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(health["ytdlp_version"], "v2026.10.26");
+        assert_eq!(health["active_jobs"], 0);
+        assert!(health["cache_bytes"].is_null());
+        assert!(health["disk_free_bytes"].is_u64() || health["disk_free_bytes"].is_null());
+        assert!(health["uptime_seconds"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn passes_embed_and_sponsorblock_options_to_ytdlp() {
+        let harness = Harness::new("");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({
+            "url": "https://youtu.be/abc",
+            "embed": ["subs", "thumbnail", "metadata"],
+            "sponsorblock": "remove",
+        })
+        .to_string();
+
+        let (status, _, _) = request(app, Method::POST, "/download", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let args = stdfs::read_to_string(harness.logs.path().join("args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        for flag in ["--embed-subs", "--embed-thumbnail", "--embed-metadata"] {
+            assert!(lines.contains(&flag), "{args}");
+        }
+        let index = lines
+            .iter()
+            .position(|arg| *arg == "--sponsorblock-remove")
+            .unwrap();
+        assert_eq!(lines[index + 1], "all");
+        assert!(!lines.contains(&"--sponsorblock-mark"));
     }
 }
