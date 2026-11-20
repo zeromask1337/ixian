@@ -317,6 +317,8 @@ Install the latest signed build from [GitHub Releases](https://github.com/zeroma
 
 By default it asks for the server URL and the Cloudflare Access service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) on import, so no secrets live in the file. Keep the token in a password manager or keychain, not in git.
 
+Shortcuts drops the body of non-2xx responses, which used to turn every yt-dlp failure into a generic "server not responding" alert. Requests from a shortcut client (`Shortcuts/...` or `BackgroundShortcutRunner/...`) therefore get the normal error JSON with status `200`; `code` still carries the real status. Any other client can ask for the same with `?soft=1`.
+
 `src/bin/build-shortcut.rs` generates and signs a new build (macOS only: needs `plutil` + `shortcuts sign`, and an iCloud login for public signing):
 
 ```sh
