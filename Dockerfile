@@ -20,13 +20,17 @@ ARG YTDLP_VERSION=2026.10.26
 
 # yt-dlp from PyPI (pinned) + ffmpeg for muxing/transcoding.
 # yt-dlp-ejs ships the YouTube challenge solver locally; no runtime GitHub fetch.
+# `default,curl-cffi` extras: TikTok (and others) impersonate a browser, which
+# needs curl_cffi; without it TikTok extraction fails with "no impersonate
+# target is available" -> HTTP 502.
 # Force IPv4: some container networks resolve IPv6 first but cannot route it.
 RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4 \
   && apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg python3 python3-venv ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
   && python3 -m venv /opt/yt-dlp \
-  && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp==${YTDLP_VERSION}" yt-dlp-ejs
+  && /opt/yt-dlp/bin/pip install --no-cache-dir --timeout 60 --retries 5 \
+    "yt-dlp[default,curl-cffi]==${YTDLP_VERSION}" yt-dlp-ejs
 
 # Node is yt-dlp's JS runtime (YouTube EJS extraction)
 RUN mkdir -p /home/node/.config/yt-dlp \

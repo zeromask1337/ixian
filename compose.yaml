@@ -14,9 +14,13 @@ services:
     # ixian reaps stale ixian-* dirs at boot and every hour.
     volumes:
       - ixian-tmp:/tmp
+      # Cookie store: without this, cookies vanish when the container is
+      # recreated (watchtower image update) and login-walled posts start failing.
+      - ixian-cookies:/data/cookies
     # Give in-flight requests time to drain before Docker sends SIGKILL.
     stop_grace_period: 30s
     # The image already defines HEALTHCHECK against /healthz; it is inherited here.
 
 volumes:
   ixian-tmp:
+  ixian-cookies:

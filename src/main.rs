@@ -3,6 +3,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path as UrlPath, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -2504,6 +2505,25 @@ fn trim_info(value: &Value) -> Value {
 
 async fn download(
     config: &Config,
+    request: DownloadRequest,
+    method: Method,
+    headers: HeaderMap,
+) -> ApiResult {
+    let url = request.url.clone();
+    let result = download_inner(config, request, method, headers).await;
+    if let Err(error) = &result {
+        warn!(
+            url = %url,
+            status = error.status.as_u16(),
+            error = %error.message,
+            "download failed"
+        );
+    }
+    result
+}
+
+async fn download_inner(
+    config: &Config,
     mut request: DownloadRequest,
     method: Method,
     headers: HeaderMap,
@@ -2939,6 +2959,12 @@ impl Jobs {
                         None
                     }
                     JobOutcome::Failed(failure) => {
+                        warn!(
+                            url = %job.request.url,
+                            code = failure.code,
+                            error = %failure.error,
+                            "job failed"
+                        );
                         state.status = JobStatus::Failed;
                         state.eta = None;
                         state.error = Some(failure);
@@ -4010,6 +4036,34 @@ async fn method_not_allowed() -> ApiError {
     ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }
 
+/// Apple Shortcuts' "Get Contents of URL" drops the body of a non-2xx response,
+/// so a failed download surfaces as an unrelated "server not responding" error
+/// instead of the yt-dlp message. Shortcut clients (`Shortcuts/...`,
+/// `BackgroundShortcutRunner/...`), requests carrying a Cloudflare Access
+/// service token, and `?soft=1` get the same JSON error body with status 200.
+async fn soft_errors(request: axum::extract::Request, next: Next) -> Response {
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    // The shortcut runs as `Shortcuts/...` on iOS and `BackgroundShortcutRunner/...`
+    // on macOS, so match the common "shortcut" part.
+    let soft = user_agent.to_ascii_lowercase().contains("shortcut")
+        || request.headers().contains_key("cf-access-client-id")
+        || request
+            .uri()
+            .query()
+            .is_some_and(|query| query.split('&').any(|pair| pair == "soft=1"));
+    let response = next.run(request).await;
+    if soft && !response.status().is_success() {
+        let (mut parts, body) = response.into_parts();
+        parts.status = StatusCode::OK;
+        return Response::from_parts(parts, body);
+    }
+    response
+}
+
 fn app_with_jobs(config: Arc<Config>, jobs: Arc<Jobs>) -> Router {
     Router::new()
         .route("/", get(root))
@@ -4045,6 +4099,7 @@ fn app_with_jobs(config: Arc<Config>, jobs: Arc<Jobs>) -> Router {
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(middleware::from_fn(soft_errors))
         .with_state(AppState { config, jobs })
 }
 
@@ -5375,6 +5430,40 @@ printf '%s\n' "${{prefix}}fake.${{ext}}"
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["code"], 404);
         assert!(error["hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn shortcut_clients_get_error_json_with_200() {
+        let harness = Harness::new("echo 'ERROR: [youtube] abc: Video unavailable' >&2; exit 1");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Shortcuts/1 CFNetwork/1 Darwin/1"),
+        );
+
+        let (status, _, body) =
+            request_with_headers(app, Method::POST, "/download", Some(payload), headers).await;
+
+        // Shortcuts drops non-2xx bodies, so it must see the real error as JSON.
+        assert_eq!(status, StatusCode::OK);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], 404);
+        assert!(error["hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn soft_query_asks_for_error_json_with_200() {
+        let harness = Harness::new("echo 'extractor exploded' >&2; exit 1");
+        let app = app(harness.config(Duration::from_secs(30)));
+        let payload = serde_json::json!({ "url": "https://youtu.be/abc" }).to_string();
+
+        let (status, _, body) = request(app, Method::POST, "/download?soft=1", Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], 502);
     }
 
     #[tokio::test]
