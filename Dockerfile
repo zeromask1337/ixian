@@ -16,7 +16,7 @@ FROM node:24-bookworm-slim
 # Pin yt-dlp so extractor behavior is stable for a given source revision; the
 # scheduled workflow in .github/workflows/bump-ytdlp.yml opens a PR when a new
 # PyPI release appears.
-ARG YTDLP_VERSION=2026.10.26
+ARG YTDLP_VERSION=2026.11.23
 
 # yt-dlp from PyPI (pinned) + ffmpeg for muxing/transcoding.
 # yt-dlp-ejs ships the YouTube challenge solver locally; no runtime GitHub fetch.
